@@ -56,6 +56,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPIMAGE_EXTRACT_AND_RUN: 1
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Zola Release ${{ github.ref_name }}"

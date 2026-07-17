@@ -7,11 +7,16 @@ set -euo pipefail
 # ANSI Escape Sequences for CRT Retro-Green Aesthetic
 GREEN='\033[0;32m'
 BRIGHT_GREEN='\033[1;32m'
+YELLOW='\033[0;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 log_info() {
     echo -e "${GREEN}[ZOLA] $1${NC}"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[ZOLA] WARNING: $1${NC}"
 }
 
 log_success() {
@@ -62,7 +67,30 @@ log_info "Applying execution permissions to binaries..."
 chmod +x "$BIN_DIR/zola-daemon"
 chmod +x "$BIN_DIR/Zola.AppImage"
 
-# 3. Write Systemd user service
+# 3. Configure uinput permissions
+log_info "Verifying kernel uinput device permissions..."
+UDEV_RULE_PATH="/etc/udev/rules.d/99-uinput.rules"
+NEEDS_RELOG=false
+
+# Check if user is in input group
+if ! groups "$USER" | grep -q "\binput\b"; then
+    log_warn "Your user is not in the 'input' group (needed to write keystrokes via evdev)."
+    log_info "Adding $USER to 'input' group (requires sudo)..."
+    sudo usermod -aG input "$USER"
+    NEEDS_RELOG=true
+fi
+
+# Check if udev rule is set up
+if [ ! -f "$UDEV_RULE_PATH" ] || ! grep -q "uinput" "$UDEV_RULE_PATH"; then
+    log_warn "Udev permission rule for /dev/uinput is missing or incorrect."
+    log_info "Writing udev rule to $UDEV_RULE_PATH (requires sudo)..."
+    echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' | sudo tee "$UDEV_RULE_PATH" > /dev/null
+    log_info "Reloading udev rules..."
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+fi
+
+# 4. Write Systemd user service
 log_info "Writing systemd user service definition..."
 cat > "$SYSTEMD_DIR/zola-backend.service" << EOF
 [Unit]
@@ -82,14 +110,14 @@ RestartSec=3
 WantedBy=default.target
 EOF
 
-# 4. Activate Systemd service
+# 5. Activate Systemd service
 log_info "Reloading systemd user configuration..."
 systemctl --user daemon-reload
 
 log_info "Enabling and starting zola-backend.service..."
 systemctl --user enable --now zola-backend.service
 
-# 5. Integrate Desktop environment shortcut
+# 6. Integrate Desktop environment shortcut
 log_info "Generating desktop integration shortcut..."
 mkdir -p "$HOME/.local/share/applications"
 cat > "$HOME/.local/share/applications/zola.desktop" << EOF
@@ -104,7 +132,7 @@ Categories=Utility;Development;
 StartupWMClass=zola
 EOF
 
-# 6. Success message banner
+# 7. Success message banner
 echo -e "${BRIGHT_GREEN}"
 echo "   ┌─────────────────────────────────────────────────────────────────┐"
 echo "   │ [ZOLA] SYSTEM DEPLOYMENT SUCCESSFUL                             │"
@@ -113,4 +141,9 @@ echo "   │ -> Frontend GUI: Accessible via desktop launchers (zola.desktop)│
 echo "   └─────────────────────────────────────────────────────────────────┘"
 echo -e "${NC}"
 
-log_success "Deployment complete. Monitor daemon with: journalctl --user -u zola-backend.service -f"
+if [ "$NEEDS_RELOG" = true ]; then
+    log_warn "You were added to the 'input' group. You MUST log out and log back in (or reboot)"
+    log_warn "for uinput keystroke injection permissions to take effect on your user session."
+else
+    log_success "Deployment complete. Monitor daemon with: journalctl --user -u zola-backend.service -f"
+fi

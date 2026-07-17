@@ -112,11 +112,9 @@ async function loadSettingsAndModels() {
     setVal('silence_rms_threshold',        currentConfig.silence_rms_threshold,        0.035);
     setVal('history_max',                  currentConfig.history_max,                  50);
 
-    // Keybindings
-    setVal('keybinding_realtime',          currentConfig.keybinding_realtime,          'ctrl+shift+r');
-    setVal('keybinding_realtime_llm',      currentConfig.keybinding_realtime_llm,      'ctrl+shift+t');
-    setVal('keybinding_batch',             currentConfig.keybinding_batch,             'ctrl+shift+b');
-    setVal('keybinding_batch_llm',         currentConfig.keybinding_batch_llm,         'ctrl+shift+g');
+    // Keybinding & Active Mode
+    setVal('active_mode',                  currentConfig.active_mode,                  'batch');
+    setVal('keybinding',                   currentConfig.keybinding,                   'ctrl+shift+v');
 
     statusMsg.className = 'commit-status success';
     statusMsg.textContent = 'REGISTRIES_LOADED_OK';
@@ -168,10 +166,8 @@ async function handleFormSubmit(e: SubmitEvent) {
     batch_chunk_s:                 getFlt('batch_chunk_s'),
     silence_rms_threshold:         getFlt('silence_rms_threshold'),
     history_max:                   getInt('history_max'),
-    keybinding_realtime:           getStr('keybinding_realtime'),
-    keybinding_realtime_llm:       getStr('keybinding_realtime_llm'),
-    keybinding_batch:              getStr('keybinding_batch'),
-    keybinding_batch_llm:          getStr('keybinding_batch_llm'),
+    active_mode:                   getStr('active_mode'),
+    keybinding:                    getStr('keybinding'),
   };
 
   try {
@@ -214,10 +210,8 @@ function applyDefaults(container: HTMLElement) {
   setVal('silence_rms_threshold',      '0.035');
   setVal('history_max',                '50');
   setVal('ollama_url',                 'http://127.0.0.1:11434');
-  setVal('keybinding_realtime',        'ctrl+shift+r');
-  setVal('keybinding_realtime_llm',    'ctrl+shift+t');
-  setVal('keybinding_batch',           'ctrl+shift+b');
-  setVal('keybinding_batch_llm',       'ctrl+shift+g');
+  setVal('active_mode',                'batch');
+  setVal('keybinding',                 'ctrl+shift+v');
 
   const ollamaSelect = form.querySelector('#ollama_model') as HTMLSelectElement;
   if (ollamaSelect && ollamaSelect.options.length > 0) {
@@ -231,13 +225,6 @@ function applyDefaults(container: HTMLElement) {
   }
 }
 
-const KEYBINDING_ROWS = [
-  { id: 'keybinding_realtime',     label: 'REALTIME',       mode: 'realtime',     desc: 'Continuous live speech → injected text (no LLM)' },
-  { id: 'keybinding_realtime_llm', label: 'REALTIME + LLM', mode: 'realtime-llm', desc: 'Continuous live speech → LLM refined output' },
-  { id: 'keybinding_batch',        label: 'BATCH',          mode: 'batch',        desc: 'One-shot recording → full transcript at once' },
-  { id: 'keybinding_batch_llm',    label: 'BATCH + LLM',    mode: 'batch-llm',    desc: 'One-shot recording → LLM polished paragraph' },
-];
-
 const view: ViewModule = {
   render(container: HTMLElement, _state: AppState, api: ZolaAPI) {
     containerElement = container;
@@ -248,25 +235,30 @@ const view: ViewModule = {
         <form id="settings-form-el">
           <div class="settings-section">
 
-            <!-- ─────────────────── KEYBINDING MATRIX ─────────────────── -->
-            <div class="settings-section-title">SYSTEM_REGISTRY // KEYBINDING_MATRIX</div>
+            <!-- ─────────────────── GLOBAL TRIGGER CONFIG ─────────────────── -->
+            <div class="settings-section-title">SYSTEM_REGISTRY // GLOBAL_TRIGGER_CONFIGURATION</div>
             <p style="font-size:11px; color: var(--subtle-green); margin: 0 0 16px; opacity: 0.8;">
-              Click a field then press any key combination to capture. Changes take effect after COMMIT.
+              Configure your single global trigger mode and key combination. Bind your hotkey to invoke the endpoint <code>/trigger</code>.
             </p>
             <div class="matrix-grid" style="margin-bottom: 28px;">
-              ${KEYBINDING_ROWS.map(row => `
               <div class="select-container" style="border: 1px solid var(--forest-green); padding: 14px; background: rgba(0,0,0,0.3);">
-                <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
-                  <span style="font-size: 11px; font-weight: 700; color: var(--phosphor-green); letter-spacing: 1px;">${row.label}</span>
-                  <span style="font-size: 10px; color: var(--forest-green);">// /trigger/${row.mode}</span>
+                <label class="select-label" for="active_mode">ACTIVE_VOICE_MODE (active_mode)</label>
+                <div class="crt-select-wrap">
+                  <select id="active_mode" class="crt-select">
+                    <option value="batch">BATCH (One-shot recording, full sentence)</option>
+                    <option value="batch-llm">BATCH + LLM (One-shot, LLM-polished)</option>
+                    <option value="realtime">REALTIME (Continuous streaming, direct injection)</option>
+                    <option value="realtime-llm">REALTIME + LLM (Continuous streaming, final LLM polish)</option>
+                  </select>
                 </div>
-                <p style="font-size: 10px; color: var(--subtle-green); margin: 0 0 10px; opacity: 0.75;">${row.desc}</p>
-                <label class="select-label" for="${row.id}">SHORTCUT (click to capture)</label>
+              </div>
+              <div class="select-container" style="border: 1px solid var(--forest-green); padding: 14px; background: rgba(0,0,0,0.3);">
+                <label class="select-label" for="keybinding">GLOBAL_SHORTCUT (click to capture)</label>
                 <input type="text"
-                       id="${row.id}"
+                       id="keybinding"
                        class="crt-select keybinding-input"
                        style="cursor: text; font-family: var(--font-mono); letter-spacing: 2px;" />
-              </div>`).join('')}
+              </div>
             </div>
 
             <!-- ─────────────────── OLLAMA LLM ────────────────────────── -->
@@ -418,11 +410,9 @@ const view: ViewModule = {
     const formEl = container.querySelector('#settings-form-el');
     if (formEl) formEl.addEventListener('submit', handleFormSubmit as any);
 
-    // Attach keybinding capture to all readonly keybinding inputs
-    KEYBINDING_ROWS.forEach(row => {
-      const input = container.querySelector(`#${row.id}`) as HTMLInputElement | null;
-      if (input) attachKeybindingCapture(input);
-    });
+    // Attach keybinding capture to the single keybinding input
+    const keybindingInput = container.querySelector('#keybinding') as HTMLInputElement | null;
+    if (keybindingInput) attachKeybindingCapture(keybindingInput);
 
     // Restore defaults button
     const restoreBtn = container.querySelector('#restore-defaults-btn');

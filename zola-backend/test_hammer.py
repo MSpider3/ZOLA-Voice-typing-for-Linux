@@ -51,6 +51,8 @@ class TestResult(NamedTuple):
 def percentile(data: list[float], p: int) -> float:
     if not data:
         return 0.0
+    if len(data) == 1:
+        return data[0]
     return statistics.quantiles(sorted(data), n=100)[p - 1]
 
 
@@ -214,10 +216,10 @@ async def test_sse_flood(client: httpx.AsyncClient) -> TestResult:
                         received += 1
                     if received >= 2:  # Read initial state_change + at least 1 more
                         break
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, httpx.TimeoutException):
             pass  # Expected — we're reading a streaming endpoint
         except Exception as e:
-            errors.append(f"client {client_id}: {str(e)[:60]}")
+            errors.append(f"client {client_id}: {type(e).__name__} - {str(e)[:60]}")
         events_received.append(received)
 
     # Trigger a status event while SSE clients are connected

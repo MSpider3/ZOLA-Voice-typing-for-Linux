@@ -105,15 +105,11 @@ _DEFAULTS: dict[str, Any] = {
     # Maximum number of transcription entries kept in memory.
     "history_max": 50,
 
-    # ── Keybindings ───────────────────────────────────────────────────────────
-    # Keyboard shortcut string for each STT trigger mode.
-    # Stored as human-readable strings (e.g. "ctrl+shift+r").
-    # The daemon does NOT register these itself — they are read by the
-    # frontend / Tauri global shortcut plugin and sent as POST /trigger/{mode}.
-    "keybinding_realtime": "ctrl+shift+r",
-    "keybinding_realtime_llm": "ctrl+shift+t",
-    "keybinding_batch": "ctrl+shift+b",
-    "keybinding_batch_llm": "ctrl+shift+g",
+    # ── Active Mode & Keybinding ──────────────────────────────────────────────
+    # Active transcription mode: batch | batch-llm | realtime | realtime-llm
+    "active_mode": "batch",
+    # Global trigger shortcut string
+    "keybinding": "ctrl+shift+v",
 }
 
 
@@ -145,10 +141,8 @@ class Config:
     batch_chunk_s: float
     silence_rms_threshold: float
     history_max: int
-    keybinding_realtime: str
-    keybinding_realtime_llm: str
-    keybinding_batch: str
-    keybinding_batch_llm: str
+    active_mode: str
+    keybinding: str
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain dict (for JSON persistence)."""
@@ -171,14 +165,17 @@ class Config:
             "batch_chunk_s": self.batch_chunk_s,
             "silence_rms_threshold": self.silence_rms_threshold,
             "history_max": self.history_max,
-            "keybinding_realtime": self.keybinding_realtime,
-            "keybinding_realtime_llm": self.keybinding_realtime_llm,
-            "keybinding_batch": self.keybinding_batch,
-            "keybinding_batch_llm": self.keybinding_batch_llm,
+            "active_mode": self.active_mode,
+            "keybinding": self.keybinding,
         }
 
     def __post_init__(self) -> None:
         """Validate all fields. Raises ValueError on bad values."""
+        if self.active_mode not in {"batch", "batch-llm", "realtime", "realtime-llm"}:
+            raise ValueError(
+                f"active_mode '{self.active_mode}' is invalid. "
+                f"Valid: {sorted({'batch', 'batch-llm', 'realtime', 'realtime-llm'})}"
+            )
         if self.whisper_realtime not in VALID_WHISPER_SIZES:
             raise ValueError(
                 f"whisper_realtime '{self.whisper_realtime}' is invalid. "

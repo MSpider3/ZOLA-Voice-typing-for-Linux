@@ -61,10 +61,10 @@ export class ZolaAPI {
     return await res.json();
   }
 
-  /** POST /trigger/{mode} */
-  async triggerAction(mode: string): Promise<any> {
-    // Mode should be: 'realtime' | 'realtime-llm' | 'batch' | 'batch-llm'
-    const res = await this.fetchWithTimeout(`${API_BASE}/trigger/${mode}`, {
+  /** POST /trigger or /trigger/{mode} */
+  async triggerAction(mode?: string): Promise<any> {
+    const url = mode ? `${API_BASE}/trigger/${mode}` : `${API_BASE}/trigger`;
+    const res = await this.fetchWithTimeout(url, {
       method: 'POST'
     });
     if (!res.ok) {

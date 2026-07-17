@@ -249,9 +249,26 @@ def broadcast_event(event_type: str, data: dict) -> None:
             logger.error("Failed to push event to SSE client queue: %s", exc)
 
 
-# --------------------------------------------------------------------------- #
-# Trigger Routes
-# --------------------------------------------------------------------------- #
+@app.post("/trigger", summary="Toggle the configured active transcription mode")
+async def trigger_active_mode(request: Request) -> JSONResponse:
+    """
+    Dynamically routes the trigger request to the configured active mode
+    (batch, batch-llm, realtime, realtime-llm) from the settings.
+    """
+    cfg = _cfg(request)
+    mode = cfg.active_mode or "batch"
+    if mode == "realtime":
+        return await trigger_realtime(request)
+    elif mode == "realtime-llm":
+        return await trigger_realtime_llm(request)
+    elif mode == "batch":
+        return await trigger_batch(request)
+    elif mode == "batch-llm":
+        return await trigger_batch_llm(request)
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid active mode: {mode}")
+
+
 @app.post("/trigger/realtime", summary="Toggle real-time continuous transcription")
 async def trigger_realtime(request: Request) -> JSONResponse:
     """

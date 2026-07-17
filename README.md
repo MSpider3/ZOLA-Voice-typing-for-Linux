@@ -122,13 +122,10 @@ window-rule {
     }
 }
 
-// Global hotkeys to trigger transcription modes
+// Global hotkey to trigger the active transcription mode (configured in app)
 binds {
-    // Super+V: Toggle Realtime Voice Typing mode
-    Mod+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger/realtime"; }
-
-    // Super+Shift+V: Toggle Batch Transcription mode
-    Mod+Shift+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger/batch"; }
+    // Super+V: Toggle Active Voice Typing mode
+    Mod+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger"; }
 }
 ```
 

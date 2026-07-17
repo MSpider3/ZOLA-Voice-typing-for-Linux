@@ -92,14 +92,11 @@ window-rule {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Keybinds: Map trigger modes directly to background HTTP triggers
+// Keybinds: Map active trigger directly to background HTTP trigger
 // ─────────────────────────────────────────────────────────────────────────────
 binds {
-    // Super+V: Toggle Realtime Voice Typing mode
-    Mod+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger/realtime"; }
-
-    // Super+Shift+V: Toggle Batch Transcription mode
-    Mod+Shift+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger/batch"; }
+    // Super+V: Toggle configured Active Voice Typing mode
+    Mod+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger"; }
 }
 ```
 
@@ -110,7 +107,7 @@ binds {
 ### stuck modifier keys
 If the daemon is killed during active typing injection, modifier keys (e.g. Shift) might remain pressed down at the kernel level. To release all keys instantly:
 ```bash
-curl -X POST http://127.0.0.1:5001/trigger/realtime
+curl -X POST http://127.0.0.1:5001/trigger
 ```
 This forces the backend state machine to run its `release_all()` routine.
 

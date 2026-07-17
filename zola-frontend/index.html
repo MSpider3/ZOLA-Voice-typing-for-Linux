@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZOLA // VOICE TERMINAL</title>
+  <meta name="description" content="Zola — Voice Typing for Linux. CRT Terminal Interface for Speech-to-Text." />
+  <link rel="stylesheet" href="/src/styles/index.css" />
+</head>
+<body>
+  <div id="app-shell">
+    <!-- Left Navigation Drawer -->
+    <nav id="nav-drawer">
+      <div class="nav-header">
+        <div class="glow-title">ZOLA</div>
+        <div class="nav-version">SYS_VER // 1.0.0</div>
+      </div>
+      <div class="nav-links">
+        <a href="#/" class="nav-link active" data-route="/">
+          <span class="nav-prefix">[ / ]</span> SYS_DASHBOARD
+        </a>
+        <a href="#/recent" class="nav-link" data-route="/recent">
+          <span class="nav-prefix">[ /tmp ]</span> RECENT
+        </a>
+        <a href="#/history" class="nav-link" data-route="/history">
+          <span class="nav-prefix">[ /var/log ]</span> TRANSCRIPTS
+        </a>
+        <a href="#/settings" class="nav-link" data-route="/settings">
+          <span class="nav-prefix">[ /etc ]</span> CONFIGURATION
+        </a>
+      </div>
+      <div class="nav-footer">
+        <div id="connection-status" class="status-indicator offline">
+          <span class="status-dot"></span> DAEMON: <span id="daemon-status">OFFLINE</span>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Main Viewport -->
+    <main id="viewport"></main>
+  </div>
+
+  <script type="module" src="/src/main.ts" defer></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# Zola Backend — Pinned Dependencies
+# Target: Python 3.11/3.12 on Fedora Linux (Intel i3 10th Gen, 20GB RAM, Iris iGPU)
+# Audio: PipeWire (via PulseAudio compat layer / PortAudio)
+# Inference: CTranslate2 (Intel MKL/oneDNN int8 — optimal for Intel CPUs)
+# Input: evdev uinput (kernel-level virtual keyboard, bypasses Wayland isolation)
+
+# --- Web Framework ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# --- Speech-to-Text (CTranslate2 backend, int8 quantized for Intel CPU) ---
+faster-whisper>=1.1.0
+
+# --- Audio Capture (PipeWire via PortAudio PulseAudio compat) ---
+sounddevice>=0.5.0
+numpy>=1.26.0
+scipy>=1.14.0
+
+# --- Kernel-Level Keystroke Injection (Wayland-safe via /dev/uinput) ---
+evdev>=1.7.0
+
+# --- Async HTTP (Ollama local API client) ---
+httpx>=0.28.0
+
+# --- System Profiling (CPU/memory telemetry, tracemalloc, cProfile support) ---
+psutil>=6.0.0

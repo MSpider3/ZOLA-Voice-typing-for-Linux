@@ -1,0 +1,74 @@
+name: "Publish Zola Release"
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish-zola:
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # --- STEP 1: COMPATIBILITY & DEPENDENCIES ---
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-cache: 'npm'
+          node-version: 20
+          cache-dependency-path: './zola-frontend/package-lock.json'
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpkgconf-dev libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev
+
+      # --- STEP 2: BUILD PYTHON DAEMON BINARY ---
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: './zola-backend/requirements.txt'
+
+      - name: Freeze Python Daemon with PyInstaller
+        run: |
+          cd zola-backend
+          pip install -r requirements.txt
+          pip install pyinstaller
+          # Freeze app.py into a single optimized standalone binary executable
+          pyinstaller --onefile --name zola-daemon app.py
+
+      # --- STEP 3: BUILD TAURI FRONTEND APPIMAGE ---
+      - name: Install Frontend Dependencies
+        run: |
+          cd zola-frontend
+          npm install
+
+      - name: Build Tauri Frontend AppImage
+        uses: tauri-apps/tauri-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Zola Release ${{ github.ref_name }}"
+          releaseBody: "Automated production build of Zola Voice Terminal and Daemon Core."
+          releaseDraft: false
+          prerelease: false
+          projectPath: "./zola-frontend"
+
+      # --- STEP 4: UPLOAD PYTHON DAEMON TO THE SAME RELEASE ---
+      - name: Upload Compiled Daemon Binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zola-backend/dist/zola-daemon
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

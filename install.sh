@@ -55,6 +55,12 @@ mkdir -p "$BIN_DIR"
 mkdir -p "$SYSTEMD_DIR"
 mkdir -p "$APP_DIR"
 
+# Stop active service if running to avoid "Text file busy" error when overwriting the binary
+if systemctl --user is-active --quiet zola-backend.service; then
+    log_info "Stopping active zola-backend.service for update..."
+    systemctl --user stop zola-backend.service
+fi
+
 # 1. Download pre-compiled assets
 log_info "Downloading standalone backend daemon binary..."
 curl -L -o "$BIN_DIR/zola-daemon" "https://github.com/$REPO/releases/download/$LATEST_RELEASE/zola-daemon"

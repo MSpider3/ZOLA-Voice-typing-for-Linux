@@ -1,25 +1,20 @@
 # ZOLA // VOICE TYPING FOR LINUX
-================================================================================
+
 [![Publish Zola Release](https://github.com/MSpider3/ZOLA-Voice-typing-for-Linux/actions/workflows/release.yml/badge.svg)](https://github.com/MSpider3/ZOLA-Voice-typing-for-Linux/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/MSpider3/ZOLA-Voice-typing-for-Linux/blob/main/LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)]()
 
 Zola is a high-performance, system-level Speech-to-Text (STT) voice-typing application specifically engineered for Linux desktops running Wayland (Fedora, Arch, Ubuntu). Designed with a distinct retro-military CRT terminal aesthetic, it provides four operation modes powered by a local Faster-Whisper engine and local Ollama model refinement.
 
-```
-   ┌────────────────────────────────────────────────────────┐
-   │                     CRT MAIN CONSOLE                   │
-   │                                                        │
-   │   [ STANDBY ]    FREQ: 16.0 kHz   RTF: 0.12            │
-   │   ──────────────────────────────────────────           │
-   │      /\    /\        /\  /\                            │
-   │     /  \  /  \  /\  /  \/  \                           │
-   │    /    \/    \/  \/        \                          │
-   │                                                        │
-   │   LIVE TRANSCRIPT:                                     │
-   │   "Zola is now running with zero lag..."               │
-   └────────────────────────────────────────────────────────┘
-```
+## UI Previews
+
+| Dashboard Console | Settings Menu |
+|:---:|:---:|
+| ![Zola Dashboard Console](docs/preview/zola_dashboard.png) | ![Zola Settings Menu](docs/preview/zola_settings.png) |
+
+| Recent Logs | Transcription History |
+|:---:|:---:|
+| ![Zola Recent Logs](docs/preview/zola_recents.png) | ![Zola Transcription History](docs/preview/zola_transcription_history.png) |
 
 ---
 
@@ -31,32 +26,42 @@ Traditional voice-typing apps on Linux face two major hurdles:
 
 Zola resolves these problems with a decoupled **split architecture**:
 
+```mermaid
+graph TD
+    subgraph Frontend [Tauri Frontend GUI]
+        UI[HTML/JS/TS View] <--> |API Calls / Status| SSE[SSE Connection Handler]
+    end
+
+    subgraph Backend [Python Daemon Core]
+        FastAPI[FastAPI Web Server] <--> state[State Manager]
+        state <--> rec[Audio Recorder]
+        state <--> stt[STT Engine: Faster-Whisper]
+        state <--> llm[LLM Engine: Ollama / Local APIs]
+    end
+
+    subgraph OS [Linux Kernel & Environment]
+        PW[PipeWire / Audio Input] --> |16kHz Mono Stream| rec
+        uinput[/dev/uinput Device] <-- |Key Injector| state
+        active[Active Target Window] <-- |Virtual Keystrokes| uinput
+    end
+
+    %% Communications
+    UI -->|POST /trigger| FastAPI
+    FastAPI -->|SSE Events / Amplitude| SSE
 ```
- ┌─────────────────────────────────────────────────────────────────────────┐
- │                            WAYLAND ENVIRONMENT                          │
- │                                                                         │
- │  ┌──────────────────┐           SSE Events        ┌──────────────────┐  │
- │  │  Zola UI         │<────────────────────────────┤  Zola Backend    │  │
- │  │  (Tauri AppImage)├────────────────────────────>│  (FastAPI Daemon)│  │
- │  └──────────────────┘          HTTP Triggers      └─────────┬────────┘  │
- └─────────────────────────────────────────────────────────────┼───────────┘
-                                                               │ evdev
-                                                               ▼
- ┌─────────────────────────────────────────────────────────────────────────┐
- │                               LINUX KERNEL                              │
- │                                                                         │
- │                            ┌──────────────────┐                         │
- │                            │ /dev/uinput      │                         │
- │                            │ (zola-virtual-kb)│                         │
- │                            └────────┬─────────┘                         │
- │                                     │ Inject Keystrokes                 │
- │                                     ▼                                   │
- │                            ┌──────────────────┐                         │
- │                            │ Target Window    │                         │
- │                            │ (Focus Input)    │                         │
- │                            └──────────────────┘                         │
- └─────────────────────────────────────────────────────────────────────────┘
-```
+
+### Connection & Communication Architecture
+* **Tauri HTTP REST API:** The frontend communicates with the backend daemon running on `http://127.0.0.1:5001`. For actions such as triggering recording, changing system settings, and updating active modes, the frontend issues standard HTTP `POST` requests.
+* **Server-Sent Events (SSE):** Since transcription and recording states occur asynchronously on background threads, the backend pushes continuous status updates to the frontend using an SSE stream (`/events`). This includes realtime microphone amplitudes (to animate the CRT oscilloscope), active recording states, logs, and completed transcription text.
+* **Exponential Backoff Connection Handler:** To ensure resilience, the frontend implements an exponential backoff reconnect handler with random jitter to automatically restore connection if the backend daemon restarts.
+
+### Step-by-Step Program Lifecycle
+1. **Shortcut Activation:** The user presses the configured global keybind (e.g., `Super + V`). The desktop compositor captures this shortcut and invokes a headless `POST` request to `http://127.0.0.1:5001/trigger`.
+2. **Audio Capture (PipeWire):** The backend state manager transitions to the `RECORDING` state and initializes a PipeWire audio input pipeline. It captures raw audio frames at 16kHz mono, calculating amplitude levels and broadcasting them instantly via `/events` to drive the frontend oscilloscope waveform.
+3. **Silence Detection (VAD):** The audio recorder runs continuous Voice Activity Detection (VAD) using Silero. If the user stops speaking for the configured threshold (e.g., 2.0 seconds), the backend automatically stops recording.
+4. **Transcription & Local LLM Refinement:** The recorded audio buffer is passed to the local `faster-whisper` model. If LLM refinement mode is enabled, the transcribed text is sent locally to Ollama (`llama3` or any configured LLM) to clean up syntax, formatting, and grammar.
+5. **Direct OS Keystroke Injection:** The final refined text is converted to virtual keyboard scancodes. The backend writes these codes directly to the `/dev/uinput` virtual keyboard device, injecting the keystrokes natively into the active foreground window.
+6. **UI State Update:** A final event is pushed to the Tauri GUI via SSE to update the transcription logs and history.
 
 ### 1. Kernel-Level Keystroke Injection (`/dev/uinput`)
 Instead of relying on buggy XWayland bridges or compositor-specific protocols (like Niri, Sway, or GNOME shell extensions), the Zola backend registers a virtual keyboard device directly with the Linux kernel `/dev/uinput` subsystem called `zola-virtual-keyboard`. When text is transcribed, the daemon translates characters to low-level scancodes and writes them directly to the input subsystem. This bypasses compositor isolation entirely, enabling input to flow to *any* active window (editors, browsers, chat tools).
@@ -161,6 +166,25 @@ binds {
     Mod+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger"; }
 }
 ```
+
+---
+
+## Contributing
+
+Contributions are welcome! Please follow these guidelines:
+
+1. **Reporting Issues:** Search existing issues before opening a new one. Provide system specs (CPU, GPU, Wayland/X11, Compositor) and backend daemon logs using:
+   ```bash
+   journalctl --user -u zola-backend.service -n 100
+   ```
+2. **Pull Requests:** 
+   - Fork the repository and create your branch from `main`.
+   - Ensure changes build locally. Clean the build caches if you experience path errors:
+     ```bash
+     cd zola-frontend/src-tauri
+     cargo clean
+     ```
+   - Commit messages should be clear and follow conventional commit styling (e.g. `feat: ...`, `fix: ...`, `docs: ...`).
 
 ---
 

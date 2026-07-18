@@ -41,8 +41,9 @@ graph TD
 
     subgraph OS [Linux Kernel & Environment]
         PW[PipeWire / Audio Input] --> |16kHz Mono Stream| rec
-        uinput[/dev/uinput Device] <-- |Key Injector| state
-        active[Active Target Window] <-- |Virtual Keystrokes| uinput
+        uinput["/dev/uinput Device"]
+        state --> |Key Injector| uinput
+        uinput --> |Virtual Keystrokes| active[Active Target Window]
     end
 
     %% Communications

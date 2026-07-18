@@ -36,6 +36,7 @@ venv.bak/
 
 # PyInstaller Spec files
 *.spec
+!zola-backend/zola-daemon.spec
 
 # Node/npm files
 node_modules/

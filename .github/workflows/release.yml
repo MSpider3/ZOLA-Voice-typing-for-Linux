@@ -48,8 +48,8 @@ jobs:
           cd zola-backend
           pip install -r requirements.txt
           pip install pyinstaller
-          # Freeze app.py into a single optimized standalone binary executable
-          pyinstaller --onefile --name zola-daemon app.py
+          # Freeze app.py using the spec configuration to include dependencies and assets
+          pyinstaller zola-daemon.spec
 
       # --- STEP 3: BUILD TAURI FRONTEND APPIMAGE ---
       - name: Install Frontend Dependencies

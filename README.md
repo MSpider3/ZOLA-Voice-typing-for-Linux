@@ -1,4 +1,4 @@
-# ZOLA // VOICE TYPING TERMINAL FOR LINUX
+# ZOLA // VOICE TYPING FOR LINUX
 ================================================================================
 [![Publish Zola Release](https://github.com/MSpider3/ZOLA-Voice-typing-for-Linux/actions/workflows/release.yml/badge.svg)](https://github.com/MSpider3/ZOLA-Voice-typing-for-Linux/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/MSpider3/ZOLA-Voice-typing-for-Linux/blob/main/LICENSE)

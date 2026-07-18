@@ -118,3 +118,22 @@ systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
 systemctl --user restart zola-backend.service
 ```
 This ensures the virtual keyboard backend knows which socket to talk to.
+
+### WebKit2GTK Grey Screen / EGL_BAD_PARAMETER Abort
+When running the pre-compiled AppImage on certain Wayland-based distributions (like Fedora or Arch Linux with Nvidia/Intel graphics), you may encounter a blank grey screen or an abort error:
+`Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...`
+
+This occurs because the pre-packaged libraries inside the cloud-built AppImage mismatch with your system's graphics/Mesa driver configurations.
+
+**Solution:** Compile the production binary natively on your machine so it links directly against your local host libraries:
+1. Navigate to the frontend folder and run the release build:
+   ```bash
+   cd zola-frontend
+   npm install
+   npm run tauri build
+   ```
+2. Copy the natively compiled binary to replace the local installer's location:
+   ```bash
+   cp src-tauri/target/release/zola-frontend ~/.local/bin/Zola.AppImage
+   chmod +x ~/.local/bin/Zola.AppImage
+   ```

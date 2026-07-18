@@ -60,7 +60,8 @@ log_info "Downloading standalone backend daemon binary..."
 curl -L -o "$BIN_DIR/zola-daemon" "https://github.com/$REPO/releases/download/$LATEST_RELEASE/zola-daemon"
 
 log_info "Downloading Tauri frontend AppImage..."
-curl -L -o "$BIN_DIR/Zola.AppImage" "https://github.com/$REPO/releases/download/$LATEST_RELEASE/zola_1.0.0_amd64.AppImage"
+VERSION_NO="${LATEST_RELEASE#v}"
+curl -L -o "$BIN_DIR/Zola.AppImage" "https://github.com/$REPO/releases/download/$LATEST_RELEASE/zola_${VERSION_NO}_amd64.AppImage"
 
 # 2. Set executable permissions
 log_info "Applying execution permissions to binaries..."

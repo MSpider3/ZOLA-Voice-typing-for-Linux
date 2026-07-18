@@ -104,10 +104,44 @@ curl -fsSL https://raw.githubusercontent.com/MSpider3/ZOLA-Voice-typing-for-Linu
 
 ---
 
-## Compositor Integration (Niri Wayland Example)
+## Desktop Environment & Compositor Integration
 
-Bind Zola triggers globally in your window manager. Add this to your `~/.config/niri/config.kdl`:
+To dictate globally in any active text field, bind a global keyboard shortcut to Zola's local API trigger endpoint.
 
+### GNOME (Fedora Default)
+1. Open **Settings** -> **Keyboard** -> **Keyboard Shortcuts** -> **View and Customise Shortcuts** -> **Custom Shortcuts**.
+2. Click **Add Shortcut** (`+`).
+3. Set **Name** to `Zola Voice Trigger`.
+4. Set **Command** to:
+   ```bash
+   curl -s -X POST http://127.0.0.1:5001/trigger
+   ```
+5. Assign your preferred keybinding (e.g., `Super + V`).
+
+### KDE Plasma
+1. Open **System Settings** -> **Shortcuts** -> **Add New** -> **Command**.
+2. Set the command to:
+   ```bash
+   curl -s -X POST http://127.0.0.1:5001/trigger
+   ```
+3. Set your preferred shortcut (e.g., `Meta + V`).
+
+### Hyprland
+Add this to your configuration file (usually `~/.config/hypr/hyprland.conf`):
+```ini
+# Trigger active Zola transcription mode
+bind = $mainMod, V, exec, curl -s -X POST http://127.0.0.1:5001/trigger
+```
+
+### Sway
+Add this to your configuration file (usually `~/.config/sway/config`):
+```sway
+# Trigger active Zola transcription mode
+bindsym Mod4+v exec curl -s -X POST http://127.0.0.1:5001/trigger
+```
+
+### Niri
+Add this to your configuration file (usually `~/.config/niri/config.kdl`):
 ```kdl
 // Float the Zola Voice Terminal window nicely in the center
 window-rule {
@@ -122,7 +156,6 @@ window-rule {
     }
 }
 
-// Global hotkey to trigger the active transcription mode (configured in app)
 binds {
     // Super+V: Toggle Active Voice Typing mode
     Mod+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger"; }

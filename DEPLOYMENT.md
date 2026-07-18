@@ -13,8 +13,8 @@ The project features a fully automated release pipeline in `.github/workflows/re
 ### How Releases are Triggered:
 1. Create a version tag and push it:
    ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v1.1.0
+   git push origin v1.1.0
    ```
 2. GitHub Actions will spin up a builder container to:
    - Compile the **Python Daemon** into a single frozen binary executable (`zola-daemon`) using PyInstaller.

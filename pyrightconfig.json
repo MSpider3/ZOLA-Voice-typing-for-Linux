@@ -1,7 +1,8 @@
 {
-  "venvPath": "zola-backend",
+  "venvPath": ".",
   "venv": ".venv",
-  "pythonVersion": "3.14",
-  "extraPaths": ["zola-backend"],
+  "extraPaths": [
+    "zola-backend"
+  ],
   "reportMissingImports": "warning"
 }

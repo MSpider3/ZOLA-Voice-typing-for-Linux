@@ -369,6 +369,7 @@ class WhisperEngine:
             chunk_size = int(sample_rate * self._config.batch_chunk_s)
             transcripts = []
             prev_text = ""
+            info = None
 
             for i in range(0, len(audio), chunk_size):
                 chunk = audio[i: i + chunk_size]
@@ -405,11 +406,12 @@ class WhisperEngine:
             transcript = " ".join(transcripts)
             elapsed = time.monotonic() - t0
             audio_duration = len(audio) / sample_rate
+            detected_lang = getattr(info, "language", "unknown") if info is not None else "unknown"
             logger.info(
                 "WhisperEngine.translate_file: %.1fs audio → %.1fs inference, "
                 "chars=%d (source lang detected: %s)",
                 audio_duration, elapsed, len(transcript),
-                getattr(info, "language", "unknown"),
+                detected_lang,
             )
             return transcript
 

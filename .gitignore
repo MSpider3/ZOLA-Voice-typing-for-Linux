@@ -28,6 +28,7 @@ share/python-wheels/
 MANIFEST
 
 # Python Virtual Environments
+.venv
 .venv/
 venv/
 ENV/

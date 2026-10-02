@@ -181,7 +181,7 @@ def run_with_cprofile():
 # ─────────────────────────────────────────────────────────────────────────────
 def run_with_pyinstrument():
     try:
-        from pyinstrument import Profiler
+        from pyinstrument import Profiler  # type: ignore
     except ImportError:
         print(f"{RED}pyinstrument not installed. Run: pip install pyinstrument{RESET}")
         sys.exit(1)

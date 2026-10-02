@@ -110,6 +110,36 @@ curl -fsSL https://raw.githubusercontent.com/MSpider3/ZOLA-Voice-typing-for-Linu
 
 ---
 
+## Configuration & Settings (`~/.config/zola/settings.json`)
+
+| Setting | Description |
+|---|---|
+| `spoken_language` | Sets language dictation mode: `en` (English), `hi` (Hindi), `mixed` (Hinglish), or `auto`. |
+| `whisper_batch` | Model used for batch transcription (default: `small`). |
+| `whisper_realtime` | Model used for realtime streaming (default: `base`). |
+
+## Models
+
+Zola relies on local CTranslate2 `faster-whisper` models:
+- **`tiny` / `base`**: Excellent for low-spec laptops or realtime feedback.
+- **`small`**: The recommended default for balanced performance and high accuracy.
+- **`large-v3-turbo`**: Highly accurate but computationally heavy; may cause thermal throttling on older laptops.
+- **`nemotron` (Experimental)**: High accuracy for pure Hindi but fails at Hinglish code-switching. Requires an optional 2-3GB PyTorch backend installation.
+
+## Requirements
+
+- **OS:** Linux (Wayland / X11)
+- **Audio:** PipeWire or PulseAudio
+- **Dependencies (Backend):** Python 3.11+, `faster-whisper`, `sounddevice`, `evdev` (for `uinput` virtual keystrokes)
+- **Dependencies (Frontend):** Tauri, WebKit2GTK
+
+## Known Limitations
+
+- **Ollama Translators**: The local HTTP endpoint `/trigger/batch-translate` is currently marked experimental. Native Whisper translation to English is heavily unreliable for Hinglish input.
+- **Nemotron Hardware Cost**: Enabling Nemotron triggers a massive PyTorch download and consumes significant memory compared to CTranslate2.
+
+---
+
 ## Desktop Environment & Compositor Integration
 
 To dictate globally in any active text field, bind a global keyboard shortcut to Zola's local API trigger endpoint.

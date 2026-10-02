@@ -181,6 +181,48 @@ async function bootstrap() {
     updateConnectionUI('OFFLINE');
   }
 
+  // Check if first-run setup is needed
+  try {
+    const config = await api.fetchSettings();
+    if (config.first_run_completed === false) {
+      const modal = document.getElementById('onboarding-modal');
+      const form = document.getElementById('onboarding-form') as HTMLFormElement;
+      
+      if (modal && form) {
+        modal.style.display = 'flex';
+        
+        form.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const hw = (document.getElementById('onboarding-hw') as HTMLSelectElement).value;
+          const lang = (document.getElementById('onboarding-lang') as HTMLSelectElement).value;
+          
+          let w_real = 'base', w_batch = 'small';
+          if (hw === 'light') { w_real = 'tiny'; w_batch = 'base'; }
+          else if (hw === 'accurate') { w_real = 'small'; w_batch = 'large-v3-turbo'; }
+          else if (hw === 'nemotron') { w_real = 'base'; w_batch = 'nemotron'; }
+          
+          const submitBtn = form.querySelector('button');
+          if (submitBtn) submitBtn.textContent = 'SAVING...';
+          
+          try {
+            await api.saveSettings({
+              whisper_realtime: w_real,
+              whisper_batch: w_batch,
+              spoken_language: lang,
+              first_run_completed: true
+            });
+            modal.style.display = 'none';
+          } catch (err) {
+            console.error('Failed to save first-run settings', err);
+            if (submitBtn) submitBtn.textContent = 'ERROR_RETRY';
+          }
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Failed to fetch config for onboarding check', err);
+  }
+
   // Start listening to the SSE stream
   api.listenToEvents(
     (event) => handleSSEEvent(event),

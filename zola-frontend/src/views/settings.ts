@@ -99,7 +99,8 @@ async function loadSettingsAndModels() {
     setVal('ollama_url',                   currentConfig.ollama_url,                   'http://127.0.0.1:11434');
     setVal('compute_type',                 currentConfig.compute_type,                 'int8');
     setVal('cpu_threads',                  currentConfig.cpu_threads,                  4);
-    setVal('language',                     currentConfig.language ?? '',               '');
+    setVal('spoken_language',              currentConfig.spoken_language ?? 'auto',    'auto');
+    setVal('output_language',              currentConfig.output_language ?? 'preserve','preserve');
     setVal('sample_rate',                  currentConfig.sample_rate,                  16000);
     setVal('typing_delay_ms',              currentConfig.typing_delay_ms,              12);
     setVal('realtime_utterance_silence_s', currentConfig.realtime_utterance_silence_s, 0.5);
@@ -145,7 +146,8 @@ async function handleFormSubmit(e: SubmitEvent) {
   const getInt  = (id: string) => parseInt(getStr(id), 10);
   const getFlt  = (id: string) => parseFloat(getStr(id));
 
-  const rawLang = getStr('language').trim();
+  const rawSpokenLang = getStr('spoken_language').trim();
+  const rawOutputLang = getStr('output_language').trim();
 
   const payload = {
     whisper_realtime:              getStr('whisper_realtime'),
@@ -154,7 +156,8 @@ async function handleFormSubmit(e: SubmitEvent) {
     ollama_url:                    getStr('ollama_url').trim(),
     compute_type:                  getStr('compute_type'),
     cpu_threads:                   getInt('cpu_threads'),
-    language:                      rawLang === '' ? null : rawLang,
+    spoken_language:               rawSpokenLang === '' ? 'auto' : rawSpokenLang,
+    output_language:               rawOutputLang === '' ? 'preserve' : rawOutputLang,
     sample_rate:                   getInt('sample_rate'),
     typing_delay_ms:               getInt('typing_delay_ms'),
     realtime_utterance_silence_s:  getFlt('realtime_utterance_silence_s'),
@@ -197,7 +200,8 @@ function applyDefaults(container: HTMLElement) {
   setVal('whisper_batch',              'small');
   setVal('compute_type',               'int8');
   setVal('cpu_threads',                '4');
-  setVal('language',                   '');
+  setVal('spoken_language',            'auto');
+  setVal('output_language',            'preserve');
   setVal('sample_rate',                '16000');
   setVal('typing_delay_ms',            '12');
   setVal('realtime_utterance_silence_s','0.5');
@@ -314,8 +318,25 @@ const view: ViewModule = {
                 <input type="number" id="cpu_threads" class="crt-select" min="1" max="64" step="1" style="cursor: text;" />
               </div>
               <div class="select-container">
-                <label class="select-label" for="language">TRANSCRIPTION_LANGUAGE (language)</label>
-                <input type="text" id="language" class="crt-select" placeholder="e.g. en, hi (leave empty for auto)" style="cursor: text;" />
+                <label class="select-label" for="spoken_language">SPOKEN_LANGUAGE (spoken_language)</label>
+                <div class="crt-select-wrap">
+                  <select id="spoken_language" class="crt-select" style="width: 100%;">
+                    <option value="auto">AUTO-DETECT (Hinglish Supported)</option>
+                    <option value="en">ENGLISH (en)</option>
+                    <option value="hi">HINDI (hi)</option>
+                    <option value="mixed">MIXED (Hinglish)</option>
+                  </select>
+                </div>
+              </div>
+              <div class="select-container">
+                <label class="select-label" for="output_language">OUTPUT_LANGUAGE (output_language)</label>
+                <div class="crt-select-wrap">
+                  <select id="output_language" class="crt-select" style="width: 100%;">
+                    <option value="preserve">PRESERVE SOURCE (Translate off)</option>
+                    <option value="english">TRANSLATE TO ENGLISH</option>
+                    <option value="hindi">TRANSLATE TO HINDI</option>
+                  </select>
+                </div>
               </div>
             </div>
 

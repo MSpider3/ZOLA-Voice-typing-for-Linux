@@ -1,24 +1,25 @@
 """
-injector.py — Kernel-Level Keystroke Injection + Clipboard Integration
-=======================================================================
-Uses python-evdev's UInput interface to create a virtual keyboard device
-registered at the kernel level via /dev/uinput. Because this operates at
-the kernel input layer, Wayland compositors (including Niri) treat events
-as coming from real hardware — bypassing Wayland's application-isolation
-security model for synthetic input.
+injector.py — Keyboard Injection + Clipboard Integration
+=========================================================
+Primary output path: clipboard paste (wl-copy + Ctrl+V via uinput).
+  → Works for ALL Unicode including Devanagari Hindi script.
+  → Reliable on Wayland/Niri without per-compositor keymap issues.
 
-PREREQUISITES (one-time system setup, NOT handled by this module):
+Fallback output path: character-by-character uinput keystrokes.
+  → US-QWERTY ASCII only (_CHAR_MAP).
+  → Used only when clipboard paste fails (e.g., password fields that
+    block paste, or when wl-copy/WAYLAND_DISPLAY is unavailable).
+
+PREREQUISITES (one-time system setup):
   1. Create udev rule:
-       echo 'KERNEL=="uinput", MODE="0660", GROUP="input"' | \
+       echo 'KERNEL=="uinput", MODE="0660", GROUP="input"' | \\
        sudo tee /etc/udev/rules.d/99-uinput.rules
        sudo udevadm control --reload-rules && sudo udevadm trigger
   2. Add user to input group:
        sudo usermod -aG input $USER
   3. Log out and back in (or reboot) to apply group membership.
 
-Wayland clipboard (wl-copy) requires WAYLAND_DISPLAY and XDG_RUNTIME_DIR.
-These are captured from os.environ at init time. When running as a systemd
-user service, ensure these are imported:
+When running as a systemd user service, ensure Wayland env is imported:
   systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
 """
 
@@ -26,20 +27,18 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional
 
-import evdev
 from evdev import UInput, ecodes
 
 logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Full US QWERTY Key Mapping
+# Full US QWERTY Key Mapping (ASCII fallback only)
 # --------------------------------------------------------------------------- #
-# Maps printable ASCII characters to (evdev keycode, requires_shift).
-# This covers all characters that appear in English + common punctuation.
-# Hinglish text (Latin-script Devanagari transliteration) uses the same set.
+# NOTE: This map is ASCII/Latin-script only.
+# Devanagari (Hindi), CJK, Arabic, and other non-Latin scripts are NOT here.
+# For those, the clipboard paste path (inject_text → _clipboard_paste) is used.
 _CHAR_MAP: dict[str, tuple[int, bool]] = {
     # Lowercase letters
     "a": (ecodes.KEY_A, False), "b": (ecodes.KEY_B, False),
@@ -55,7 +54,7 @@ _CHAR_MAP: dict[str, tuple[int, bool]] = {
     "u": (ecodes.KEY_U, False), "v": (ecodes.KEY_V, False),
     "w": (ecodes.KEY_W, False), "x": (ecodes.KEY_X, False),
     "y": (ecodes.KEY_Y, False), "z": (ecodes.KEY_Z, False),
-    # Uppercase letters (shift + key)
+    # Uppercase
     "A": (ecodes.KEY_A, True), "B": (ecodes.KEY_B, True),
     "C": (ecodes.KEY_C, True), "D": (ecodes.KEY_D, True),
     "E": (ecodes.KEY_E, True), "F": (ecodes.KEY_F, True),
@@ -110,9 +109,10 @@ _CHAR_MAP: dict[str, tuple[int, bool]] = {
     "+": (ecodes.KEY_EQUAL, True),
 }
 
-# Complete set of keycodes needed to declare to the kernel
 _ALL_KEYS = list({keycode for keycode, _ in _CHAR_MAP.values()} | {
     ecodes.KEY_LEFTSHIFT,
+    ecodes.KEY_LEFTCTRL,
+    ecodes.KEY_V,
     ecodes.KEY_BACKSPACE,
     ecodes.KEY_SPACE,
     ecodes.KEY_ENTER,
@@ -120,24 +120,28 @@ _ALL_KEYS = list({keycode for keycode, _ in _CHAR_MAP.values()} | {
 })
 
 
+def _text_is_ascii_only(text: str) -> bool:
+    """Return True if text contains only characters in _CHAR_MAP (pure ASCII/Latin)."""
+    return all(c in _CHAR_MAP for c in text)
+
+
 class KeystrokeInjector:
     """
-    Virtual keyboard driver using evdev UInput.
+    Text injection driver for Wayland.
+
+    inject_text() is the main entry point. It tries clipboard paste first
+    (works for ALL Unicode, including Devanagari Hindi) and falls back to
+    uinput character-by-character only for pure ASCII text when paste fails.
 
     type_text() and erase_chars() are synchronous and must be run in a
-    ThreadPoolExecutor from async code. They contain time.sleep() calls
-    for compositor stability which would block the event loop if awaited.
+    ThreadPoolExecutor. They contain time.sleep() calls for compositor stability.
 
-    copy_to_clipboard() is async because wl-copy is invoked as a subprocess
-    via asyncio.create_subprocess_exec().
+    copy_to_clipboard() and inject_text() are async (use asyncio subprocess).
     """
 
     def __init__(self) -> None:
-        # Capture Wayland environment at init time (from the user session that
-        # launched the daemon). These are required by wl-copy.
         self._wayland_env = _capture_wayland_env()
 
-        # Create the virtual keyboard device
         try:
             capabilities = {ecodes.EV_KEY: _ALL_KEYS}
             self._ui = UInput(capabilities, name="zola-virtual-keyboard", version=0x3)
@@ -164,18 +168,120 @@ class KeystrokeInjector:
             raise
 
     # ----------------------------------------------------------------------- #
-    # Keystroke Injection (synchronous — run in ThreadPoolExecutor)
+    # Primary injection path — clipboard paste (Unicode-safe)
+    # ----------------------------------------------------------------------- #
+    async def inject_text(self, text: str, delay_ms: int = 12) -> None:
+        """
+        Main entry point for injecting transcribed text into the focused app.
+
+        Strategy:
+          1. Try wl-copy + Ctrl+V paste (works for all Unicode, including Hindi).
+          2. If paste fails (wl-copy missing, WAYLAND_DISPLAY not set, or the
+             target app blocks Ctrl+V), fall back to uinput character-by-character.
+             The fallback silently skips any non-ASCII characters.
+
+        This means Hindi Devanagari output from Whisper (अ, आ, ि…) works
+        correctly via paste, whereas the old uinput-only path would silently
+        drop every Devanagari character.
+        """
+        if not text:
+            return
+
+        # Attempt 1: clipboard paste (primary — Unicode-safe)
+        paste_ok = await self._clipboard_paste(text, delay_ms)
+        if paste_ok:
+            return
+
+        # Attempt 2: uinput fallback (ASCII only — logs skipped non-ASCII chars)
+        if not _text_is_ascii_only(text):
+            logger.warning(
+                "KeystrokeInjector.inject_text: clipboard paste failed and text contains "
+                "non-ASCII characters (%d chars). Non-ASCII will be skipped in uinput fallback. "
+                "Ensure wl-clipboard is installed and WAYLAND_DISPLAY is set.",
+                len(text),
+            )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.type_text, text, delay_ms)
+
+    async def _clipboard_paste(self, text: str, delay_ms: int = 12) -> bool:
+        """
+        Copy text to Wayland clipboard with wl-copy, then simulate Ctrl+V.
+        Returns True on success, False on any failure (caller should fallback).
+        """
+        missing_env = [k for k in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")
+                       if not self._wayland_env.get(k)]
+        if missing_env:
+            logger.debug(
+                "KeystrokeInjector._clipboard_paste: missing env %s — skipping paste path",
+                missing_env,
+            )
+            return False
+
+        try:
+            # Step 1: write to clipboard
+            proc = await asyncio.create_subprocess_exec(
+                "wl-copy", "--", text,
+                env=self._wayland_env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode != 0:
+                err = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
+                logger.error(
+                    "KeystrokeInjector._clipboard_paste: wl-copy exited %d: %s",
+                    proc.returncode, err,
+                )
+                return False
+
+            # Step 2: simulate Ctrl+V to paste into the focused window
+            # Small settle delay so the compositor processes the clipboard write
+            await asyncio.sleep(0.05)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._send_ctrl_v, delay_ms)
+
+            logger.debug(
+                "KeystrokeInjector._clipboard_paste: pasted %d chars via wl-copy+Ctrl+V",
+                len(text),
+            )
+            return True
+
+        except FileNotFoundError:
+            logger.error(
+                "KeystrokeInjector._clipboard_paste: 'wl-copy' not found. "
+                "Install with: sudo dnf install wl-clipboard"
+            )
+            return False
+        except asyncio.TimeoutError:
+            logger.error("KeystrokeInjector._clipboard_paste: wl-copy timed out after 5s")
+            return False
+        except Exception as exc:
+            logger.exception("KeystrokeInjector._clipboard_paste: unexpected error: %s", exc)
+            return False
+
+    def _send_ctrl_v(self, delay_ms: int = 12) -> None:
+        """Simulate Ctrl+V keystroke via uinput to trigger paste in the focused app."""
+        delay_s = delay_ms / 1000.0
+        try:
+            self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 1)
+            self._ui.write(ecodes.EV_KEY, ecodes.KEY_V, 1)
+            self._ui.write(ecodes.EV_KEY, ecodes.KEY_V, 0)
+            self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 0)
+            self._ui.syn()
+            time.sleep(delay_s)
+        except Exception as exc:
+            logger.error("KeystrokeInjector._send_ctrl_v: error: %s", exc)
+            self.release_all()
+
+    # ----------------------------------------------------------------------- #
+    # ASCII fallback path — character-by-character uinput
     # ----------------------------------------------------------------------- #
     def type_text(self, text: str, delay_ms: int = 12) -> None:
         """
-        Simulate typing `text` character by character via kernel UInput events.
-        Each character is broken into press → release (+ shift if needed).
-
-        Args:
-            text:     The string to type.
-            delay_ms: Inter-key delay in milliseconds. 12ms is the minimum
-                      that Niri needs to process events reliably. Increase
-                      to 20-30ms for applications with slow input handlers.
+        Simulate typing text character by character via kernel UInput events.
+        ASCII/Latin only. Non-ASCII characters are silently skipped with a warning.
+        This is the FALLBACK path — inject_text() tries clipboard paste first.
         """
         if not text:
             return
@@ -195,13 +301,12 @@ class KeystrokeInjector:
                 try:
                     if needs_shift:
                         self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTSHIFT, 1)
-                    self._ui.write(ecodes.EV_KEY, keycode, 1)   # key down
-                    self._ui.write(ecodes.EV_KEY, keycode, 0)   # key up
+                    self._ui.write(ecodes.EV_KEY, keycode, 1)
+                    self._ui.write(ecodes.EV_KEY, keycode, 0)
                     if needs_shift:
                         self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTSHIFT, 0)
                     self._ui.syn()
                     time.sleep(delay_s)
-
                 except Exception as exc:
                     logger.error(
                         "KeystrokeInjector.type_text: error emitting char %r: %s", char, exc
@@ -215,26 +320,15 @@ class KeystrokeInjector:
         if skipped:
             logger.warning(
                 "KeystrokeInjector.type_text: %d character(s) skipped (not in keymap): %s",
-                len(skipped),
-                ", ".join(skipped),
+                len(skipped), ", ".join(skipped[:10]),
             )
 
     def erase_chars(self, count: int, delay_ms: int = 8) -> None:
-        """
-        Emit `count` KEY_BACKSPACE events to erase previously typed text.
-        Used by the realtime backspace-diff correction mechanism.
-
-        Args:
-            count:    Number of characters to erase.
-            delay_ms: Inter-key delay. Can be slightly faster than type_text
-                      since backspace doesn't trigger shift sequences.
-        """
+        """Emit `count` KEY_BACKSPACE events to erase previously typed text."""
         if count <= 0:
             return
 
         delay_s = delay_ms / 1000.0
-        logger.debug("KeystrokeInjector.erase_chars: erasing %d character(s)", count)
-
         try:
             for _ in range(count):
                 self._ui.write(ecodes.EV_KEY, ecodes.KEY_BACKSPACE, 1)
@@ -246,16 +340,12 @@ class KeystrokeInjector:
             self.release_all()
 
     # ----------------------------------------------------------------------- #
-    # Clipboard Integration (async — uses asyncio subprocess)
+    # Clipboard-only copy (for session-end clipboard update, not injection)
     # ----------------------------------------------------------------------- #
     async def copy_to_clipboard(self, text: str) -> None:
         """
-        Store `text` in the Wayland clipboard using wl-copy.
-        Runs concurrently with keystroke injection (fire-and-forget).
-
-        WAYLAND_DISPLAY and XDG_RUNTIME_DIR are injected explicitly into the
-        subprocess environment so this works from systemd user services that
-        may not inherit the full session environment.
+        Store text in the Wayland clipboard using wl-copy (no paste).
+        Used at session end so the full transcript is available for manual paste.
         """
         if not text:
             return
@@ -264,10 +354,7 @@ class KeystrokeInjector:
                    if not self._wayland_env.get(k)]
         if missing:
             logger.warning(
-                "KeystrokeInjector.copy_to_clipboard: missing env vars %s — "
-                "wl-copy may fail. Run: systemctl --user import-environment "
-                "WAYLAND_DISPLAY XDG_RUNTIME_DIR",
-                missing,
+                "KeystrokeInjector.copy_to_clipboard: missing env vars %s", missing
             )
 
         try:
@@ -278,20 +365,16 @@ class KeystrokeInjector:
                 stderr=asyncio.subprocess.PIPE,
             )
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-
             if proc.returncode != 0:
-                err_msg = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
+                err = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
                 logger.error(
                     "KeystrokeInjector.copy_to_clipboard: wl-copy exited %d: %s",
-                    proc.returncode,
-                    err_msg,
+                    proc.returncode, err,
                 )
             else:
                 logger.debug(
-                    "KeystrokeInjector.copy_to_clipboard: %d chars copied to clipboard",
-                    len(text),
+                    "KeystrokeInjector.copy_to_clipboard: %d chars in clipboard", len(text)
                 )
-
         except FileNotFoundError:
             logger.error(
                 "KeystrokeInjector.copy_to_clipboard: 'wl-copy' not found. "
@@ -303,10 +386,7 @@ class KeystrokeInjector:
             logger.exception("KeystrokeInjector.copy_to_clipboard: unexpected error: %s", exc)
 
     async def send_notification(self, title: str, message: str) -> None:
-        """
-        Send a desktop notification using notify-send.
-        Uses the captured Wayland environment to communicate with DBus.
-        """
+        """Send a desktop notification using notify-send."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "notify-send", title, message,
@@ -315,23 +395,16 @@ class KeystrokeInjector:
                 stderr=asyncio.subprocess.PIPE,
             )
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-
             if proc.returncode != 0:
-                err_msg = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
+                err = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
                 logger.error(
                     "KeystrokeInjector.send_notification: notify-send exited %d: %s",
-                    proc.returncode,
-                    err_msg,
+                    proc.returncode, err,
                 )
-            else:
-                logger.debug("KeystrokeInjector.send_notification: desktop notification sent")
         except FileNotFoundError:
-            logger.error(
-                "KeystrokeInjector.send_notification: 'notify-send' not found. "
-                "Install with your package manager (e.g. libnotify or libnotify-bin)."
-            )
+            logger.error("KeystrokeInjector.send_notification: 'notify-send' not found.")
         except asyncio.TimeoutError:
-            logger.error("KeystrokeInjector.send_notification: notify-send timed out after 5s")
+            logger.error("KeystrokeInjector.send_notification: notify-send timed out")
         except Exception as exc:
             logger.exception("KeystrokeInjector.send_notification: unexpected error: %s", exc)
 
@@ -339,14 +412,10 @@ class KeystrokeInjector:
     # Cleanup
     # ----------------------------------------------------------------------- #
     def release_all(self) -> None:
-        """
-        Forcefully release all registered keys (especially modifier keys like KEY_LEFTSHIFT)
-        to prevent the operating system from getting stuck keys during a crash or shutdown.
-        """
+        """Forcefully release all registered keys to prevent stuck modifiers."""
         if not hasattr(self, "_ui") or self._ui is None:
             return
         try:
-            logger.info("KeystrokeInjector: releasing all virtual keys")
             for keycode in _ALL_KEYS:
                 self._ui.write(ecodes.EV_KEY, keycode, 0)
             self._ui.syn()
@@ -370,61 +439,42 @@ class KeystrokeInjector:
 def _capture_wayland_env() -> dict[str, str]:
     """
     Build the minimal environment dict needed for Wayland subprocess calls.
-    Starts from the full current environment (so PATH, HOME, etc. are correct)
-    and verifies the two critical Wayland variables are present.
-
-    Fallback probe: if XDG_RUNTIME_DIR or WAYLAND_DISPLAY are missing (common
-    in systemd --user services where import-environment was not called), probe
-    the standard /run/user/<uid>/ XDG directory for Wayland socket files
-    (wayland-0, wayland-1, etc.).
+    Probes XDG_RUNTIME_DIR and WAYLAND_DISPLAY if missing from environment.
     """
     env = dict(os.environ)
 
-    # --- XDG_RUNTIME_DIR fallback ---
     if "XDG_RUNTIME_DIR" not in env:
         uid = os.getuid()
         xdg_fallback = f"/run/user/{uid}"
         if os.path.isdir(xdg_fallback):
             env["XDG_RUNTIME_DIR"] = xdg_fallback
-            logger.info(
-                "injector: probed XDG_RUNTIME_DIR=%s (was missing from environment)",
-                xdg_fallback,
-            )
+            logger.info("injector: probed XDG_RUNTIME_DIR=%s", xdg_fallback)
         else:
             logger.warning(
-                "injector: 'XDG_RUNTIME_DIR' not found in environment and "
-                "%s does not exist. wl-copy clipboard integration will not work. "
-                "If running as a systemd service, run: "
-                "systemctl --user import-environment XDG_RUNTIME_DIR",
+                "injector: XDG_RUNTIME_DIR not found and %s does not exist. "
+                "wl-copy clipboard integration will not work. "
+                "Run: systemctl --user import-environment XDG_RUNTIME_DIR",
                 xdg_fallback,
             )
 
-    # --- WAYLAND_DISPLAY fallback ---
     if "WAYLAND_DISPLAY" not in env:
         runtime = env.get("XDG_RUNTIME_DIR", "")
         probed = False
         if runtime and os.path.isdir(runtime):
             from pathlib import Path as _Path
-            # Look for wayland-0, wayland-1, etc. (standard Wayland socket names)
             for sock in sorted(_Path(runtime).glob("wayland-*")):
                 try:
                     if sock.is_socket():
-                        env["WAYLAND_DISPLAY"] = sock.name  # e.g. "wayland-0"
-                        logger.info(
-                            "injector: probed WAYLAND_DISPLAY=%s from %s",
-                            sock.name, runtime,
-                        )
+                        env["WAYLAND_DISPLAY"] = sock.name
+                        logger.info("injector: probed WAYLAND_DISPLAY=%s", sock.name)
                         probed = True
                         break
                 except OSError:
                     continue
         if not probed:
             logger.warning(
-                "injector: 'WAYLAND_DISPLAY' not found in environment and no "
-                "wayland-* socket found in XDG_RUNTIME_DIR. "
-                "wl-copy clipboard integration will not work. "
-                "If running as a systemd service, run: "
-                "systemctl --user import-environment WAYLAND_DISPLAY",
+                "injector: WAYLAND_DISPLAY not found and no wayland-* socket in "
+                "XDG_RUNTIME_DIR. Run: systemctl --user import-environment WAYLAND_DISPLAY"
             )
 
     return env

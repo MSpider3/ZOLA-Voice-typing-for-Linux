@@ -40,6 +40,52 @@
     <main id="viewport"></main>
   </div>
 
+  <!-- Onboarding / First-Run Walkthrough Modal -->
+  <div id="onboarding-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.85); z-index: 9999; align-items: center; justify-content: center;">
+    <div style="background: var(--bg-dark); border: 1px solid var(--forest-green); padding: 30px; max-width: 600px; width: 100%; box-shadow: 0 0 20px rgba(51, 255, 102, 0.2);">
+      <h2 style="color: var(--phosphor-green); margin-top: 0;">ZOLA // INITIALIZATION WIZARD</h2>
+      <p style="color: var(--subtle-green); font-size: 14px; margin-bottom: 20px;">
+        Please configure your system for optimal performance. These settings can be changed later in CONFIGURATION.
+      </p>
+      
+      <form id="onboarding-form">
+        <div style="margin-bottom: 15px;">
+          <label style="display: block; color: var(--phosphor-green); font-size: 12px; margin-bottom: 5px;">1. HARDWARE PROFILE</label>
+          <select id="onboarding-hw" class="crt-select" style="width: 100%; background: #000; color: var(--phosphor-green); border: 1px solid var(--forest-green); padding: 8px;">
+            <option value="balanced">Balanced (Most laptops: base + small)</option>
+            <option value="light">Light (Low-spec: tiny + base)</option>
+            <option value="accurate">Accurate (High-end: small + large-v3-turbo)</option>
+            <option value="nemotron">Nemotron (Hindi-only, Experimental)</option>
+          </select>
+          <div id="nemotron-warning" style="display: none; margin-top: 10px; padding: 10px; border: 1px dashed #ff3333; color: #ff3333; font-size: 11px;">
+            <strong>Nemotron (Hindi-only, Experimental)</strong><br>
+            ⚠️ Requires 2-3GB PyTorch download.<br>
+            ⚠️ Fails on Hinglish or multi-language (101% WER on code-switching).<br>
+            Only suitable for pure Hindi or English monolingual dictation.
+          </div>
+        </div>
+        <script>
+          document.getElementById('onboarding-hw').addEventListener('change', function(e) {
+            document.getElementById('nemotron-warning').style.display = e.target.value === 'nemotron' ? 'block' : 'none';
+          });
+        </script>
+
+        <div style="margin-bottom: 20px;">
+          <label style="display: block; color: var(--phosphor-green); font-size: 12px; margin-bottom: 5px;">2. PRIMARY LANGUAGE</label>
+          <select id="onboarding-lang" class="crt-select" style="width: 100%; background: #000; color: var(--phosphor-green); border: 1px solid var(--forest-green); padding: 8px;">
+            <option value="auto">Auto-Detect / Hinglish (Mixed)</option>
+            <option value="en">English (Strict)</option>
+            <option value="hi">Hindi (Strict Devanagari)</option>
+          </select>
+        </div>
+
+        <button type="submit" style="width: 100%; background: var(--forest-green); color: #000; border: none; padding: 12px; font-weight: bold; cursor: pointer; text-transform: uppercase;">
+          INITIALIZE_SYSTEM
+        </button>
+      </form>
+    </div>
+  </div>
+
   <script type="module" src="/src/main.ts" defer></script>
 </body>
 </html>

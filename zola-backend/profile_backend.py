@@ -172,7 +172,7 @@ def run_with_cprofile():
     print(stream.getvalue())
 
     print(f"\n{BOLD}Tip:{RESET} cProfile measures wall-clock time including asyncio machinery.")
-    print(f"If async routes look suspicious, switch to pyinstrument for a cleaner graph:")
+    print("If async routes look suspicious, switch to pyinstrument for a cleaner graph:")
     print(f"  {CYAN}pip install pyinstrument && PROFILER=pyinstrument python profile_backend.py{RESET}\n")
 
 
@@ -219,8 +219,8 @@ def main():
         print(f"  Daemon: {GREEN}reachable{RESET}\n")
     except Exception as e:
         print(f"\n  {RED}ERROR: Daemon not reachable at {BASE_URL}: {e}{RESET}")
-        print(f"  Start it first with:")
-        print(f"    uvicorn app:app --host 127.0.0.1 --port 5001")
+        print("  Start it first with:")
+        print("    uvicorn app:app --host 127.0.0.1 --port 5001")
         sys.exit(1)
 
     if PROFILER_MODE == "pyinstrument":

@@ -43,11 +43,22 @@ jobs:
           cache: 'pip'
           cache-dependency-path: './zola-backend/requirements.txt'
 
+      - name: Cache HuggingFace Models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-models-${{ hashFiles('zola-backend/config.py') }}
+          restore-keys: |
+            huggingface-models-
+
       - name: Freeze Python Daemon with PyInstaller
         run: |
           cd zola-backend
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pip-audit bandit pyflakes
+          pip-audit -r requirements.txt
+          bandit -r . -q
+          pyflakes *.py
           # Freeze app.py using the spec configuration to include dependencies and assets
           pyinstaller zola-daemon.spec
 

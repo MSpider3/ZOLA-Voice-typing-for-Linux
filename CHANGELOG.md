@@ -2,6 +2,20 @@
 
 All notable changes to the Zola Voice Typing project will be documented in this file.
 
+## [1.2.0] - 2026-10-02
+
+### Added
+- **Language Selection**: Added support for Hindi and Code-Switched (Hinglish) dictation.
+- **Hinglish Optimizations**: Native prompting engine configured to stop Hindi code-switching hallucinations on English words.
+- **Experimental Nemotron Support**: Added optional NVIDIA Nemotron support for pure monolingual Hindi/English dictation (requires massive dependency download).
+- **GUI Wizard**: Added an interactive setup wizard in the Zola app to select language and hardware profiles.
+
+### Fixed
+- **Hindi Clipboard Unicode Bug**: Switched from `pyautogui` to `xclip` / `wl-copy` for reliable UTF-8 pasting of Devanagari characters on Linux.
+- **Security Hardening**: Closed open CORS vulnerabilities and prevented arbitrary URL loading in Ollama local endpoints.
+- **Thermal Throttling Control**: Reverted the default batch model from `large-v3-turbo` to `small` to prevent sustained thermal throttling on laptops.
+- **Realtime Latency Fix**: Corrected VAD thresholds preventing silence detection lockups.
+
 ## [1.1.1] - 2026-07-18
 
 ### Fixed

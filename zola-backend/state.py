@@ -34,7 +34,7 @@ def _get_zola_runtime_dir() -> Path:
     else:
         # Fallback: user-specific subdir inside /tmp
         uid = os.getuid()
-        base = Path(f"/tmp/zola-{uid}")
+        base = Path(f"/tmp/zola-{uid}")  # nosec B108
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     return base
 

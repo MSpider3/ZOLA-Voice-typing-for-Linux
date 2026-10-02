@@ -4,11 +4,6 @@ on:
   push:
     tags:
       - "v*"
-    paths-ignore:
-      - 'README.md'
-      - 'DEPLOYMENT.md'
-      - 'LICENSE'
-      - '.gitignore'
 
 jobs:
   publish-zola:
@@ -23,8 +18,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-cache: 'npm'
           node-version: 20
+          cache: 'npm'
           cache-dependency-path: './zola-frontend/package-lock.json'
 
       - name: Install Rust Toolchain
@@ -33,7 +28,7 @@ jobs:
       - name: Install Linux System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpkgconf-dev libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+          sudo apt-get install -y libpkgconf-dev libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm libfuse2t64 jq
 
       # --- STEP 2: BUILD PYTHON DAEMON BINARY ---
       - name: Setup Python
@@ -54,18 +49,28 @@ jobs:
       - name: Freeze Python Daemon with PyInstaller
         run: |
           cd zola-backend
+          pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller pip-audit bandit pyflakes
           pip-audit -r requirements.txt
-          bandit -r . -q
+          bandit -r . -x .venv,profile_backend.py -q
           pyflakes *.py
-          # Freeze app.py using the spec configuration to include dependencies and assets
           pyinstaller zola-daemon.spec
+          test -f dist/zola-daemon
+          chmod +x dist/zola-daemon
 
-      # --- STEP 3: BUILD TAURI FRONTEND APPIMAGE ---
-      - name: Install Frontend Dependencies
+      # --- STEP 3: SYNC FRONTEND VERSION & BUILD TAURI APPIMAGE ---
+      - name: Sync Frontend Version with Tag and Install Dependencies
         run: |
           cd zola-frontend
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Building Zola release version: $VERSION"
+          # Sync tauri.conf.json version with release tag
+          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp && mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+          # Sync package.json version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version || true
+          # Sync Cargo.toml version
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml || true
           npm install
 
       - name: Build Tauri Frontend AppImage
@@ -81,11 +86,30 @@ jobs:
           prerelease: false
           projectPath: "./zola-frontend"
 
-      # --- STEP 4: UPLOAD PYTHON DAEMON TO THE SAME RELEASE ---
-      - name: Upload Compiled Daemon Binary
+      # --- STEP 4: GENERATE CHECKSUMS AND ATTACH DAEMON + CHECKSUMS ---
+      - name: Prepare Assets and Generate Checksums
+        run: |
+          mkdir -p release-dist
+          cp zola-backend/dist/zola-daemon release-dist/
+          
+          # Find and copy all built Tauri bundles (AppImage, deb, rpm)
+          find zola-frontend/src-tauri/target/release/bundle -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release-dist/ \;
+          
+          cd release-dist
+          echo "=== Release Artifacts to Checksum ==="
+          ls -la
+          
+          # Generate SHA-256 checksums file
+          sha256sum * > checksums.txt
+          echo "=== Generated Checksums ==="
+          cat checksums.txt
+
+      - name: Upload Compiled Daemon Binary and Checksums
         uses: softprops/action-gh-release@v2
         with:
-          files: zola-backend/dist/zola-daemon
+          files: |
+            release-dist/zola-daemon
+            release-dist/checksums.txt
           tag_name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

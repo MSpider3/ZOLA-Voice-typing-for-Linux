@@ -1,7 +1,7 @@
 # Zola Backend — Pinned Dependencies
-# Target: Python 3.11/3.12 on Fedora Linux (Intel i3 10th Gen, 20GB RAM, Iris iGPU)
+# Target: Python 3.11/3.12 on Linux (x86_64)
 # Audio: PipeWire (via PulseAudio compat layer / PortAudio)
-# Inference: CTranslate2 (Intel MKL/oneDNN int8 — optimal for Intel CPUs)
+# Inference: CTranslate2 (int8 quantized)
 # Input: evdev uinput (kernel-level virtual keyboard, bypasses Wayland isolation)
 
 # --- Web Framework ---

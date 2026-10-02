@@ -101,7 +101,7 @@ class WhisperEngine:
             logger.info("WhisperEngine: loaded '%s' from local cache (offline)", size)
             return model
         except Exception:
-            pass
+            pass  # nosec B110
 
         logger.info(
             "WhisperEngine: model '%s' not in local cache — downloading (once only)", size

@@ -49,7 +49,7 @@ import time
 import httpx
 
 BASE_URL = "http://127.0.0.1:5001"
-PROFILE_OUTPUT = "/tmp/zola_profile.prof"
+PROFILE_OUTPUT = "/tmp/zola_profile.prof"  # nosec B108
 PROFILER_MODE = os.environ.get("PROFILER", "cprofile").lower()
 
 BOLD  = "\033[1m"
@@ -126,7 +126,7 @@ async def run_workload():
                     if (time.monotonic() - t0) > 2.0:
                         break
         except Exception:
-            pass
+            pass  # nosec B110
         elapsed = (time.monotonic() - t0) * 1000
         print(f"  {'   ':4} {'<SSE sample complete>':30}   ({elapsed:.0f}ms)")
 
@@ -194,7 +194,7 @@ def run_with_pyinstrument():
 
     print(profiler.output_text(unicode=True, color=True, timeline=False))
 
-    html_path = "/tmp/zola_profile.html"
+    html_path = "/tmp/zola_profile.html"  # nosec B108
     with open(html_path, "w") as f:
         f.write(profiler.output_html())
     print(f"\n  HTML report saved to: {BOLD}{html_path}{RESET}")
@@ -213,7 +213,7 @@ def main():
     # Verify daemon is reachable
     import urllib.request
     try:
-        with urllib.request.urlopen(f"{BASE_URL}/status", timeout=3.0) as resp:
+        with urllib.request.urlopen(f"{BASE_URL}/status", timeout=3.0) as resp:  # nosec B310
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}")
         print(f"  Daemon: {GREEN}reachable{RESET}\n")

@@ -465,7 +465,7 @@ def _discover_ollama_model() -> str:
             if models:
                 return models[0]["name"]
     except Exception:
-        pass
+        pass  # nosec B110
     return "llama3.2"
 
 

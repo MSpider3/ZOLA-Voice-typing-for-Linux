@@ -664,8 +664,8 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
         try:
             await app_state.stop_recording()
             broadcast_event("state_change", app_state.get_status())
-        except Exception:
-            pass
+        except Exception as b_err:
+            logger.debug("Broadcast cancellation state change ignored: %s", b_err)
     except Exception as exc:
         logger.exception("Batch pipeline error: %s", exc)
         audio_path_err, _ = recorder.stop()
@@ -673,8 +673,8 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
         try:
             await app_state.stop_recording()
             broadcast_event("state_change", app_state.get_status())
-        except Exception:
-            pass
+        except Exception as b_err:
+            logger.debug("Broadcast error state change ignored: %s", b_err)
     finally:
         # Clean up the per-session temp audio file
         if audio_path and Path(audio_path).exists():
@@ -755,8 +755,8 @@ async def _realtime_loop(request: Request) -> None:
         try:
             await app_state.stop_recording()
             broadcast_event("state_change", app_state.get_status())
-        except Exception:
-            pass
+        except Exception as b_err:
+            logger.debug("Broadcast final state change ignored: %s", b_err)
 
         duration_s = time.monotonic() - session_start
         full_text = " ".join(session_transcript)

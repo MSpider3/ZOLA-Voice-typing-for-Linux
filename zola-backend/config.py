@@ -70,7 +70,6 @@ _DEFAULTS: dict[str, Any] = {
     "whisper_batch": "small",
     "compute_type": "int8",
     # Set to physical core count, NOT logical thread count.
-    # i3-1005G1 = 2 physical cores / 4 logical threads.
     # CTranslate2 (oneDNN) performs better at physical core count.
     "cpu_threads": 2,
 
@@ -327,14 +326,14 @@ def load_config() -> Config:
             raw["cpu_threads"] = 2
             migrated = True
         # Revert large-v3-turbo back to small for sustained thermal safety.
-        # large-v3-turbo hits RTF 3.63 under sustained load on i3 due to
-        # thermal throttling (91°C → CPU downclocks from 3300→2800 MHz).
+        # large-v3-turbo can cause thermal throttling and latency degradation
+        # under sustained load on compact laptops.
         if raw.get("whisper_batch") == "large-v3-turbo":
             raw["whisper_batch"] = "small"
             migrated = True
             logger.info(
                 "Migrated whisper_batch from 'large-v3-turbo' back to 'small' — "
-                "large-v3-turbo causes thermal throttling on i3 under sustained load. "
+                "large-v3-turbo can cause thermal throttling under sustained load. "
                 "Set manually in settings.json if you want to override."
             )
 

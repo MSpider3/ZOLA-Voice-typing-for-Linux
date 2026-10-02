@@ -2,7 +2,7 @@
 core_stt.py — faster-whisper Engine with Hot-Reload
 =====================================================
 Loads and manages WhisperModel instances backed by CTranslate2.
-CTranslate2 uses Intel MKL / oneDNN for CPU inference.
+CTranslate2 uses oneDNN / OpenBLAS for CPU inference.
 
 Two models are kept resident in RAM simultaneously:
   - 'realtime' model (default: base, int8)          → ~150MB RAM

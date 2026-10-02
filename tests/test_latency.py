@@ -14,7 +14,8 @@ def test_perceived_latency():
     
     for model_name in ["tiny", "base", "small"]:
         print(f"\nLoading {model_name}...")
-        model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=2)
+        threads = max(1, (os.cpu_count() or 2) // 2)
+        model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=threads)
         
         # Warmup
         model.transcribe(chunk, beam_size=1)

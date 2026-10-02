@@ -8,7 +8,7 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 
-# --- Speech-to-Text (CTranslate2 backend, int8 quantized for Intel CPU) ---
+# --- Speech-to-Text (CTranslate2 backend, int8 quantized) ---
 faster-whisper>=1.1.0
 
 # --- Audio Capture (PipeWire via PortAudio PulseAudio compat) ---

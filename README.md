@@ -123,8 +123,8 @@ curl -fsSL https://raw.githubusercontent.com/MSpider3/ZOLA-Voice-typing-for-Linu
 Zola relies on local CTranslate2 `faster-whisper` models:
 - **`tiny` / `base`**: Excellent for low-spec laptops or realtime feedback.
 - **`small`**: The recommended default for balanced performance and high accuracy.
-- **`large-v3-turbo`**: Highly accurate but computationally heavy; may cause thermal throttling on older laptops.
-- **`nemotron` (Experimental)**: High accuracy for pure Hindi but fails at Hinglish code-switching. Requires an optional 2-3GB PyTorch backend installation.
+- **`large-v3-turbo`**: Highly accurate but computationally heavy; may cause thermal throttling on compact laptops.
+- **`nemotron`**: Evaluated for monolingual Hindi/English; deferred to v1.3.0 for a dedicated modular engine due to high code-switching error rates and PyTorch overhead.
 
 ## Requirements
 
@@ -136,7 +136,7 @@ Zola relies on local CTranslate2 `faster-whisper` models:
 ## Known Limitations
 
 - **Ollama Translators**: The local HTTP endpoint `/trigger/batch-translate` is currently marked experimental. Native Whisper translation to English is heavily unreliable for Hinglish input.
-- **Nemotron Hardware Cost**: Enabling Nemotron triggers a massive PyTorch download and consumes significant memory compared to CTranslate2.
+- **Code-Switching Support**: CTranslate2 `faster-whisper` remains the primary engine; multilingual models require the curated Hinglish priming prompt for optimal code-switching accuracy.
 
 ---
 

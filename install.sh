@@ -129,15 +129,14 @@ if [ -t 0 ]; then
     echo "1) Light (Low-spec laptops, fast but less accurate)"
     echo "2) Balanced (Most modern laptops)"
     echo "3) Accurate (High-end CPU/M-series, downloads ~1.5GB model)"
-    echo -e "4) Nemotron (Hindi-only or English-only, Experimental)"
-    echo -e "   ${RED}⚠️ Requires 2-3GB PyTorch download.${NC}"
-    echo -e "   ${RED}⚠️ Fails on Hinglish or multi-language (101% WER on code-switching).${NC}"
-    echo -e "   ${YELLOW}Only suitable for pure Hindi or English monolingual dictation.${NC}"
     read -r -p "Select profile [2]: " hw_choice
     case "$hw_choice" in
         1) w_real="tiny"; w_batch="base" ;;
         3) w_real="small"; w_batch="large-v3-turbo" ;;
-        4) w_real="base"; w_batch="nemotron" ;;
+        4) 
+            log_warn "Nemotron modular engine support is slated for v1.3.0. Defaulting to Balanced profile."
+            w_real="base"; w_batch="small"
+            ;;
         *) w_real="base"; w_batch="small" ;;
     esac
 

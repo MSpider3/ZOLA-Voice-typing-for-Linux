@@ -55,20 +55,8 @@
             <option value="balanced">Balanced (Most laptops: base + small)</option>
             <option value="light">Light (Low-spec: tiny + base)</option>
             <option value="accurate">Accurate (High-end: small + large-v3-turbo)</option>
-            <option value="nemotron">Nemotron (Experimental, Hindi/English only)</option>
           </select>
-          <div id="nemotron-warning" style="display: none; margin-top: 10px; padding: 10px; border: 1px dashed #ff3333; color: #ff3333; font-size: 11px;">
-            <strong>Nemotron (Hindi-only or English-only, Experimental)</strong><br>
-            ⚠️ Requires 2-3GB PyTorch download.<br>
-            ⚠️ Fails on Hinglish or multi-language (101% WER on code-switching).<br>
-            Only suitable for pure Hindi or English monolingual dictation.
-          </div>
         </div>
-        <script>
-          document.getElementById('onboarding-hw').addEventListener('change', function(e) {
-            document.getElementById('nemotron-warning').style.display = e.target.value === 'nemotron' ? 'block' : 'none';
-          });
-        </script>
 
         <div style="margin-bottom: 20px;">
           <label style="display: block; color: var(--phosphor-green); font-size: 12px; margin-bottom: 5px;">2. PRIMARY LANGUAGE</label>

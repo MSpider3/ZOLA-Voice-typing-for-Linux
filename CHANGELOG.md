@@ -7,7 +7,7 @@ All notable changes to the Zola Voice Typing project will be documented in this 
 ### Added
 - **Language Selection**: Added support for Hindi and Code-Switched (Hinglish) dictation.
 - **Hinglish Optimizations**: Native prompting engine configured to stop Hindi code-switching hallucinations on English words.
-- **Experimental Nemotron Support**: Added optional NVIDIA Nemotron support for pure monolingual Hindi/English dictation (requires massive dependency download).
+- **Nemotron Evaluation**: Evaluated NVIDIA Nemotron for monolingual Hindi/English dictation; deferred to v1.3.0 modular engine release due to 101% WER on Hinglish code-switching.
 - **GUI Wizard**: Added an interactive setup wizard in the Zola app to select language and hardware profiles.
 
 ### Fixed

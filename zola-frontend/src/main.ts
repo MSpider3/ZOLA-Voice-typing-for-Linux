@@ -199,7 +199,6 @@ async function bootstrap() {
           let w_real = 'base', w_batch = 'small';
           if (hw === 'light') { w_real = 'tiny'; w_batch = 'base'; }
           else if (hw === 'accurate') { w_real = 'small'; w_batch = 'large-v3-turbo'; }
-          else if (hw === 'nemotron') { w_real = 'base'; w_batch = 'nemotron'; }
           
           const submitBtn = form.querySelector('button');
           if (submitBtn) submitBtn.textContent = 'SAVING...';

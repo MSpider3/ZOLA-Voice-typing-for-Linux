@@ -95,13 +95,14 @@ export class ZolaAPI {
 
   /** POST /settings */
   async saveSettings(settings: Record<string, any>): Promise<any> {
+    // Long timeout: changing a Whisper model can trigger a multi-minute download
     const res = await this.fetchWithTimeout(`${API_BASE}/settings`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(settings)
-    });
+    }, 600000);
     if (!res.ok) {
       const detail = await res.json().catch(() => ({ detail: 'Failed to save settings' }));
       throw new Error(detail.detail || `Save settings failed: ${res.status}`);

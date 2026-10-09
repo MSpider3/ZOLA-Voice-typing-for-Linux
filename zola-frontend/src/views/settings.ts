@@ -109,8 +109,6 @@ async function loadSettingsAndModels() {
     setVal('realtime_silence_timeout_s',   currentConfig.realtime_silence_timeout_s,   3.0);
     setVal('batch_silence_timeout_s',      currentConfig.batch_silence_timeout_s,      3.0);
     setVal('batch_min_record_s',           currentConfig.batch_min_record_s,           0.5);
-    setVal('batch_chunk_s',               currentConfig.batch_chunk_s,               6.0);
-    setVal('silence_rms_threshold',        currentConfig.silence_rms_threshold,        0.035);
     setVal('history_max',                  currentConfig.history_max,                  50);
 
     // Keybinding & Active Mode
@@ -166,8 +164,6 @@ async function handleFormSubmit(e: SubmitEvent) {
     realtime_silence_timeout_s:    getFlt('realtime_silence_timeout_s'),
     batch_silence_timeout_s:       getFlt('batch_silence_timeout_s'),
     batch_min_record_s:            getFlt('batch_min_record_s'),
-    batch_chunk_s:                 getFlt('batch_chunk_s'),
-    silence_rms_threshold:         getFlt('silence_rms_threshold'),
     history_max:                   getInt('history_max'),
     active_mode:                   getStr('active_mode'),
     keybinding:                    getStr('keybinding'),
@@ -199,19 +195,17 @@ function applyDefaults(container: HTMLElement) {
   setVal('whisper_realtime',           'base');
   setVal('whisper_batch',              'small');
   setVal('compute_type',               'int8');
-  setVal('cpu_threads',                '4');
+  setVal('cpu_threads',                '2');
   setVal('spoken_language',            'auto');
   setVal('output_language',            'preserve');
   setVal('sample_rate',                '16000');
   setVal('typing_delay_ms',            '12');
-  setVal('realtime_utterance_silence_s','0.5');
-  setVal('realtime_force_commit_s',    '2.5');
+  setVal('realtime_utterance_silence_s','0.7');
+  setVal('realtime_force_commit_s',    '10.0');
   setVal('realtime_chunk_s',           '1.0');
   setVal('realtime_silence_timeout_s', '3.0');
   setVal('batch_silence_timeout_s',    '3.0');
   setVal('batch_min_record_s',         '0.5');
-  setVal('batch_chunk_s',             '6.0');
-  setVal('silence_rms_threshold',      '0.035');
   setVal('history_max',                '50');
   setVal('ollama_url',                 'http://127.0.0.1:11434');
   setVal('active_mode',                'batch');
@@ -251,6 +245,7 @@ const view: ViewModule = {
                   <select id="active_mode" class="crt-select">
                     <option value="batch">BATCH (One-shot recording, full sentence)</option>
                     <option value="batch-llm">BATCH + LLM (One-shot, LLM-polished)</option>
+                    <option value="batch-translate">BATCH TRANSLATE (Experimental, Whisper → English)</option>
                     <option value="realtime">REALTIME (Continuous streaming, direct injection)</option>
                     <option value="realtime-llm">REALTIME + LLM (Continuous streaming, final LLM polish)</option>
                   </select>
@@ -306,9 +301,8 @@ const view: ViewModule = {
                 <div class="crt-select-wrap">
                   <select id="compute_type" class="crt-select">
                     <option value="int8">INT8 (OPTIMIZED CPU)</option>
-                    <option value="int8_float16">INT8_FLOAT16</option>
+                    <option value="int8_float32">INT8_FLOAT32</option>
                     <option value="int16">INT16</option>
-                    <option value="float16">FLOAT16 (OPTIMIZED GPU)</option>
                     <option value="float32">FLOAT32</option>
                   </select>
                 </div>
@@ -334,7 +328,6 @@ const view: ViewModule = {
                   <select id="output_language" class="crt-select" style="width: 100%;">
                     <option value="preserve">PRESERVE SOURCE (Translate off)</option>
                     <option value="english">TRANSLATE TO ENGLISH</option>
-                    <option value="hindi">TRANSLATE TO HINDI</option>
                   </select>
                 </div>
               </div>
@@ -348,16 +341,8 @@ const view: ViewModule = {
                 <div class="crt-select-wrap">
                   <select id="sample_rate" class="crt-select">
                     <option value="16000">16000 HZ (WHISPER STANDARD)</option>
-                    <option value="8000">8000 HZ</option>
-                    <option value="22050">22050 HZ</option>
-                    <option value="44100">44100 HZ</option>
-                    <option value="48000">48000 HZ</option>
                   </select>
                 </div>
-              </div>
-              <div class="select-container">
-                <label class="select-label" for="silence_rms_threshold">SILENCE_RMS_THRESHOLD (silence_rms_threshold)</label>
-                <input type="number" id="silence_rms_threshold" class="crt-select" min="0.001" max="1.0" step="0.001" style="cursor: text;" />
               </div>
             </div>
 
@@ -392,10 +377,6 @@ const view: ViewModule = {
               <div class="select-container">
                 <label class="select-label" for="batch_min_record_s">MINIMUM_RECORD_DURATION (batch_min_record_s)</label>
                 <input type="number" id="batch_min_record_s" class="crt-select" min="0.0" max="10.0" step="0.1" style="cursor: text;" />
-              </div>
-              <div class="select-container">
-                <label class="select-label" for="batch_chunk_s">PROCESSING_SEGMENT_SIZE (batch_chunk_s)</label>
-                <input type="number" id="batch_chunk_s" class="crt-select" min="1.0" max="60.0" step="0.5" style="cursor: text;" />
               </div>
             </div>
 

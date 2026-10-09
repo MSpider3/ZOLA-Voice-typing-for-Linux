@@ -167,6 +167,16 @@ class KeystrokeInjector:
             logger.exception("KeystrokeInjector: failed to create UInput device: %s", exc)
             raise
 
+    def _missing_wayland_env(self) -> list[str]:
+        """
+        Names of the Wayland env vars still missing. Re-probes first, because
+        the daemon may have started before the compositor created its socket.
+        """
+        keys = ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")
+        if not all(self._wayland_env.get(k) for k in keys):
+            self._wayland_env = _capture_wayland_env()
+        return [k for k in keys if not self._wayland_env.get(k)]
+
     # ----------------------------------------------------------------------- #
     # Primary injection path — clipboard paste (Unicode-safe)
     # ----------------------------------------------------------------------- #
@@ -208,8 +218,7 @@ class KeystrokeInjector:
         Copy text to Wayland clipboard with wl-copy, then simulate Ctrl+V.
         Returns True on success, False on any failure (caller should fallback).
         """
-        missing_env = [k for k in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")
-                       if not self._wayland_env.get(k)]
+        missing_env = self._missing_wayland_env()
         if missing_env:
             logger.debug(
                 "KeystrokeInjector._clipboard_paste: missing env %s — skipping paste path",
@@ -350,8 +359,7 @@ class KeystrokeInjector:
         if not text:
             return
 
-        missing = [k for k in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")
-                   if not self._wayland_env.get(k)]
+        missing = self._missing_wayland_env()
         if missing:
             logger.warning(
                 "KeystrokeInjector.copy_to_clipboard: missing env vars %s", missing

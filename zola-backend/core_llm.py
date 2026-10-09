@@ -99,7 +99,9 @@ class OllamaClient:
             "options": {
                 "temperature": 0.1,
                 "top_p": 0.9,
-                "num_predict": 512,
+                # Scale with the input so long dictations are not cut off
+                # (Devanagari can need more than one token per character).
+                "num_predict": max(512, 2 * len(transcript)),
             },
         }
 
@@ -113,6 +115,13 @@ class OllamaClient:
             response.raise_for_status()
             data = response.json()
             cleaned = data.get("response", "").strip()
+
+            if data.get("done_reason") == "length":
+                logger.warning(
+                    "OllamaClient.format_transcript: output hit the token limit — "
+                    "returning original transcript instead of a truncated one"
+                )
+                return transcript
 
             if not cleaned:
                 logger.warning(
@@ -153,6 +162,11 @@ class OllamaClient:
         except Exception as exc:
             logger.exception("OllamaClient.format_transcript: unexpected error: %s", exc)
             return transcript
+
+    def set_base_url(self, url: str) -> None:
+        """Point the client at a new Ollama URL (POST /settings, no restart)."""
+        self._base_url = url.rstrip("/")
+        self._client.base_url = self._base_url
 
     # ----------------------------------------------------------------------- #
     # Model Discovery

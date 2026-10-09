@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Set
 from urllib.parse import urlparse
@@ -42,7 +42,8 @@ VALID_WHISPER_SIZES = {
     "large-v3-turbo",   # 6x faster than large-v3, negligible accuracy loss
     "distil-large-v3",  # DEPRECATED for multilingual — 89% WER on Hindi, auto-translates to English
 }
-VALID_COMPUTE_TYPES = {"int8", "int8_float16", "int16", "float16", "float32"}
+# CPU-only: float16 variants need a GPU and make CTranslate2 refuse to load.
+VALID_COMPUTE_TYPES = {"int8", "int8_float32", "int16", "float32"}
 
 # Valid Whisper language codes relevant to Zola's target languages.
 # None = auto-detect (recommended for Hinglish / code-switching sessions).
@@ -112,10 +113,6 @@ _DEFAULTS: dict[str, Any] = {
     # ── Batch Transcription ───────────────────────────────────────────────────
     "batch_silence_timeout_s": 3.0,
     "batch_min_record_s": 0.5,
-    "batch_chunk_s": 6.0,
-
-    # ── Silence Detection ─────────────────────────────────────────────────────
-    "silence_rms_threshold": 0.035,
 
     # ── History ───────────────────────────────────────────────────────────────
     "history_max": 50,
@@ -157,8 +154,6 @@ class Config:
     realtime_silence_timeout_s: float
     batch_silence_timeout_s: float
     batch_min_record_s: float
-    batch_chunk_s: float
-    silence_rms_threshold: float
     history_max: int
     active_mode: str
     keybinding: str
@@ -186,8 +181,6 @@ class Config:
             "realtime_silence_timeout_s": self.realtime_silence_timeout_s,
             "batch_silence_timeout_s": self.batch_silence_timeout_s,
             "batch_min_record_s": self.batch_min_record_s,
-            "batch_chunk_s": self.batch_chunk_s,
-            "silence_rms_threshold": self.silence_rms_threshold,
             "history_max": self.history_max,
             "active_mode": self.active_mode,
             "keybinding": self.keybinding,
@@ -196,6 +189,21 @@ class Config:
 
     def __post_init__(self) -> None:
         """Validate all fields. Raises ValueError on bad values."""
+
+        # ── Types (POST /settings passes raw JSON values) ──
+        for field in fields(self):
+            name, expected = field.name, field.type
+            value = getattr(self, name)
+            if expected is float:
+                ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+            elif expected is int:
+                ok = isinstance(value, int) and not isinstance(value, bool)
+            elif expected in (str, bool):
+                ok = isinstance(value, expected)
+            else:  # str | None
+                ok = value is None or isinstance(value, str)
+            if not ok:
+                raise ValueError(f"{name} has the wrong type ({type(value).__name__}).")
 
         # ── Active mode ──
         valid_modes = {"batch", "batch-llm", "batch-translate", "realtime", "realtime-llm"}
@@ -251,24 +259,22 @@ class Config:
         _validate_ollama_url(self.ollama_url)
 
         # ── Numeric ranges ──
-        if self.sample_rate not in (8000, 16000, 22050, 44100, 48000):
-            raise ValueError(f"sample_rate {self.sample_rate} is not a standard rate.")
+        if self.sample_rate != 16000:
+            raise ValueError("sample_rate must be 16000 (Whisper input rate; no resampling).")
         if not (0 < self.typing_delay_ms <= 200):
             raise ValueError("typing_delay_ms must be between 1 and 200.")
         if not (1 <= self.cpu_threads <= (os.cpu_count() or 1)):
             raise ValueError(
                 f"cpu_threads must be between 1 and {os.cpu_count()} on this machine."
             )
-        if self.silence_rms_threshold < 0 or self.silence_rms_threshold > 1.0:
-            raise ValueError("silence_rms_threshold must be between 0.0 and 1.0.")
 
         # ── Duration fields must be positive ──
         if self.realtime_utterance_silence_s < 0:
             raise ValueError("realtime_utterance_silence_s must be >= 0.")
         if self.realtime_force_commit_s <= 0:
             raise ValueError("realtime_force_commit_s must be positive.")
-        if self.batch_chunk_s <= 0:
-            raise ValueError("batch_chunk_s must be positive.")
+        if self.realtime_chunk_s <= 0:
+            raise ValueError("realtime_chunk_s must be positive.")
         if self.history_max < 1:
             raise ValueError("history_max must be at least 1.")
         if self.max_record_duration_s < 0:
@@ -304,41 +310,12 @@ def load_config() -> Config:
         logger.info("No config file found — generating defaults at %s", CONFIG_PATH)
         _write_defaults()
 
-    migrated = False
     try:
         raw: dict[str, Any] = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
-        # Migration: upgrade stale defaults on existing installs
-        if raw.get("realtime_force_commit_s") == 10.0:
-            raw["realtime_force_commit_s"] = 2.5
-            migrated = True
-        if raw.get("realtime_utterance_silence_s") == 0.8:
-            raw["realtime_utterance_silence_s"] = 0.7
-            migrated = True
-        if raw.get("realtime_chunk_s") == 2.0:
-            raw["realtime_chunk_s"] = 1.0
-            migrated = True
-        if raw.get("silence_rms_threshold") == 0.02:
-            raw["silence_rms_threshold"] = 0.035
-            migrated = True
-        # Migrate cpu_threads=4 on 2-core machines to physical core count
-        if raw.get("cpu_threads") == 4 and (os.cpu_count() or 4) <= 4:
-            raw["cpu_threads"] = 2
-            migrated = True
-        # Revert large-v3-turbo back to small for sustained thermal safety.
-        # large-v3-turbo can cause thermal throttling and latency degradation
-        # under sustained load on compact laptops.
-        if raw.get("whisper_batch") == "large-v3-turbo":
-            raw["whisper_batch"] = "small"
-            migrated = True
-            logger.info(
-                "Migrated whisper_batch from 'large-v3-turbo' back to 'small' — "
-                "large-v3-turbo can cause thermal throttling under sustained load. "
-                "Set manually in settings.json if you want to override."
-            )
-
     except json.JSONDecodeError as exc:
         logger.error("Malformed JSON in config: %s — resetting to defaults", exc)
+        _backup_config()
         _write_defaults()
         raw = {}
 
@@ -348,12 +325,13 @@ def load_config() -> Config:
     try:
         cfg = Config(**merged)
         logger.info("Configuration loaded from %s", CONFIG_PATH)
-        if migrated or (set(_DEFAULTS.keys()) - set(raw.keys())):
-            logger.info("Updating %s with new default keys/migrations", CONFIG_PATH)
+        if set(_DEFAULTS.keys()) - set(raw.keys()):
+            logger.info("Updating %s with new default keys", CONFIG_PATH)
             save_config(cfg)
         return cfg
     except (TypeError, ValueError) as exc:
         logger.error("Config validation failed: %s — reverting to defaults", exc)
+        _backup_config()
         _write_defaults()
         return Config(**_DEFAULTS)
 
@@ -361,10 +339,13 @@ def load_config() -> Config:
 def save_config(cfg: Config) -> None:
     """Persist the current Config state to settings.json."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
+    # Write-then-rename so a crash mid-save cannot leave a truncated file.
+    tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(
         json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    os.replace(tmp_path, CONFIG_PATH)
     logger.debug("Configuration saved to %s", CONFIG_PATH)
 
 
@@ -389,7 +370,7 @@ def update_config(cfg: Config, partial: dict[str, Any]) -> Set[str]:
     if changed:
         try:
             cfg.__post_init__()
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             logger.error("Config update rejected (validation): %s — rolling back", exc)
             for key in changed:
                 setattr(cfg, key, current[key])
@@ -444,6 +425,14 @@ def _validate_ollama_url(url: str) -> None:
             f"ollama_url host '{host}' must be 'localhost' or a loopback IP "
             f"(127.x.x.x / ::1). Hostnames other than 'localhost' are not allowed."
         ) from exc
+
+
+def _backup_config() -> None:
+    """Keep the rejected settings.json as settings.json.bak before it is overwritten."""
+    try:
+        shutil.copy2(CONFIG_PATH, CONFIG_PATH.with_suffix(".json.bak"))
+    except OSError as exc:
+        logger.error("Could not back up %s: %s", CONFIG_PATH, exc)
 
 
 def _discover_ollama_model() -> str:

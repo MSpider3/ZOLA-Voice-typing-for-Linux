@@ -53,12 +53,12 @@ graph TD
 
 ### Connection & Communication Architecture
 * **Tauri HTTP REST API:** The frontend communicates with the backend daemon running on `http://127.0.0.1:5001`. For actions such as triggering recording, changing system settings, and updating active modes, the frontend issues standard HTTP `POST` requests.
-* **Server-Sent Events (SSE):** Since transcription and recording states occur asynchronously on background threads, the backend pushes continuous status updates to the frontend using an SSE stream (`/events`). This includes realtime microphone amplitudes (to animate the CRT oscilloscope), active recording states, logs, and completed transcription text.
+* **Server-Sent Events (SSE):** Since transcription and recording states occur asynchronously on background threads, the backend pushes continuous status updates to the frontend using an SSE stream (`/events`). This includes active recording states and completed transcription text.
 * **Exponential Backoff Connection Handler:** To ensure resilience, the frontend implements an exponential backoff reconnect handler with random jitter to automatically restore connection if the backend daemon restarts.
 
 ### Step-by-Step Program Lifecycle
 1. **Shortcut Activation:** The user presses the configured global keybind (e.g., `Super + V`). The desktop compositor captures this shortcut and invokes a headless `POST` request to `http://127.0.0.1:5001/trigger`.
-2. **Audio Capture (PipeWire):** The backend state manager transitions to the `RECORDING` state and initializes a PipeWire audio input pipeline. It captures raw audio frames at 16kHz mono, calculating amplitude levels and broadcasting them instantly via `/events` to drive the frontend oscilloscope waveform.
+2. **Audio Capture (PipeWire):** The backend state manager transitions to the `RECORDING` state and initializes a PipeWire audio input pipeline. It captures raw audio frames at 16kHz mono.
 3. **Silence Detection (VAD):** The audio recorder runs continuous Voice Activity Detection (VAD) using Silero. If the user stops speaking for the configured threshold (e.g., 2.0 seconds), the backend automatically stops recording.
 4. **Transcription & Local LLM Refinement:** The recorded audio buffer is passed to the local `faster-whisper` model. If LLM refinement mode is enabled, the transcribed text is sent locally to Ollama (`llama3` or any configured LLM) to clean up syntax, formatting, and grammar.
 5. **Direct OS Keystroke Injection:** The final refined text is converted to virtual keyboard scancodes. The backend writes these codes directly to the `/dev/uinput` virtual keyboard device, injecting the keystrokes natively into the active foreground window.
@@ -76,7 +76,7 @@ Instead of relying on buggy XWayland bridges or compositor-specific protocols (l
 ### 3. Asynchronous Event Synchronization
 The Tauri frontend communicates with the backend via two channels:
 - **HTTP POST Request Triggers:** To trigger recordings or change settings.
-- **Server-Sent Events (SSE):** The frontend listens to `/events` for state changes and raw audio amplitudes. To ensure resilience, the frontend implements an exponential backoff reconnect handler with random jitter.
+- **Server-Sent Events (SSE):** The frontend listens to `/events` for state changes and transcripts. To ensure resilience, the frontend implements an exponential backoff reconnect handler with random jitter.
 
 ### 4. Optimized Frontend Rendering
 - **Canvas Visibility Throttling:** The CRT phosphor oscilloscope view uses the Page Visibility API. If the window is minimized or hidden, it draws a flat black frame (preventing frozen-frame compositor artifacts) and halts the animation loop, reducing GPU usage to 0%.
@@ -91,7 +91,7 @@ The Tauri frontend communicates with the backend via two channels:
   2. **Batch + LLM Refinement:** Transcribes audio, passes the text to a local Ollama model for grammar correction and formatting, copies to clipboard, and types it.
   3. **Realtime STT:** Streams audio and types words continuously as you speak.
   4. **Realtime + LLM Refinement:** Streams live transcription and performs final formatting cleanup when speaking stops.
-- **CRT Phosphor Visualizer:** Genuine simulated green-glow analog oscilloscope showing mic amplitudes.
+- **CRT Phosphor Visualizer:** Simulated green-glow analog oscilloscope that reflects the idle / recording / offline state.
 - **Automatic Legacy Migration:** Automatically migrates configurations from `~/.config/speaktype/` to `~/.config/zola/` on boot without crashing.
 - **Hardened Error Fail-safes:** Employs a custom `release_all()` routine ensuring that if the daemon crashes mid-injection, modifier keys (like Shift or Ctrl) do not remain stuck.
 

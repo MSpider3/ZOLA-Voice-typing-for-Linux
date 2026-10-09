@@ -72,7 +72,7 @@ if curl --output /dev/null --silent --head --fail "$CHECKSUMS_URL"; then
     EXPECTED_DAEMON_HASH=$(curl --fail --show-error -sL "$CHECKSUMS_URL" | grep "zola-daemon" | cut -d' ' -f1)
     ACTUAL_DAEMON_HASH=$(sha256sum "$BIN_DIR/zola-daemon" | cut -d' ' -f1)
     
-    if [ -n "$EXPECTED_DAEMON_HASH" ] && [ "$EXPECTED_DAEMON_HASH" != "$ACTUAL_DAEMON_HASH" ]; then
+    if [ -z "$EXPECTED_DAEMON_HASH" ] || [ "$EXPECTED_DAEMON_HASH" != "$ACTUAL_DAEMON_HASH" ]; then
         log_error "Checksum mismatch for zola-daemon. Aborting."
         rm -f "$BIN_DIR/zola-daemon"
         exit 1
@@ -82,7 +82,7 @@ if curl --output /dev/null --silent --head --fail "$CHECKSUMS_URL"; then
     EXPECTED_APP_HASH=$(curl --fail --show-error -sL "$CHECKSUMS_URL" | grep "$APPIMAGE_NAME" | cut -d' ' -f1)
     ACTUAL_APP_HASH=$(sha256sum "$BIN_DIR/Zola.AppImage" | cut -d' ' -f1)
     
-    if [ -n "$EXPECTED_APP_HASH" ] && [ "$EXPECTED_APP_HASH" != "$ACTUAL_APP_HASH" ]; then
+    if [ -z "$EXPECTED_APP_HASH" ] || [ "$EXPECTED_APP_HASH" != "$ACTUAL_APP_HASH" ]; then
         log_error "Checksum mismatch for AppImage. Aborting."
         rm -f "$BIN_DIR/Zola.AppImage"
         exit 1
@@ -205,9 +205,6 @@ EOF
 log_info "Reloading systemd user configuration..."
 systemctl --user daemon-reload
 
-log_info "Enabling systemd linger for background persistence..."
-loginctl enable-linger "$USER"
-
 log_info "Enabling and starting zola-backend.service..."
 systemctl --user enable --now zola-backend.service
 
@@ -236,7 +233,7 @@ echo "   └──────────────────────�
 echo -e "${NC}"
 
 if [ "$NEEDS_RELOG" = true ]; then
-    log_warn "You were added to the 'input' group. You MUST log out and log back in (or reboot)"
+    log_warn "A udev rule for /dev/uinput was installed. You MUST log out and log back in (or reboot)"
     log_warn "for uinput keystroke injection permissions to take effect on your user session."
 else
     log_success "Deployment complete. Monitor daemon with: journalctl --user -u zola-backend.service -f"

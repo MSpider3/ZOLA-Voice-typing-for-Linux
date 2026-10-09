@@ -4,6 +4,11 @@ import { ZolaAPI } from '../api';
 let animFrameId: number | null = null;
 let containerElement: HTMLElement | null = null;
 let visibilityHandler: (() => void) | null = null;
+let uptimeTimer: number | null = null;
+
+// The trace is decorative; 15 fps keeps the CPU free for transcription.
+const FRAME_INTERVAL_MS = 1000 / 15;
+let lastFrameTime = 0;
 
 // Oscilloscope state variables
 let phase = 0;
@@ -13,9 +18,9 @@ function drawOscilloscope(ctx: CanvasRenderingContext2D, width: number, height: 
   // Do NOT use clearRect. Instead paint a semi-transparent black layer over the
   // previous frame. The residual brightness of the old trace creates authentic
   // phosphor persistence / ghosting without needing any extra render targets.
-  // Opacity 0.12 gives ~3-4 frames of decay at 60 fps — enough glow without lag.
+  // Opacity 0.4 at 15 fps gives the same decay time as 0.12 did at 60 fps.
   ctx.globalCompositeOperation = 'source-over';
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
   ctx.fillRect(0, 0, width, height);
 
   // ── CRT GRID (redrawn every frame at very low opacity to stay subtle) ──────
@@ -86,7 +91,7 @@ function drawOscilloscope(ctx: CanvasRenderingContext2D, width: number, height: 
   ctx.shadowBlur = 0; // reset shadow for grid lines on next frame
 
   // Advance phase
-  phase += 0.15;
+  phase += 0.6;
 }
 
 /** Draw a clean black frame to blank the canvas before pausing */
@@ -104,6 +109,11 @@ function startAnimation(canvas: HTMLCanvasElement, appState: AppState) {
     // Guard: bail immediately if hidden, canvas removed, or destroy() was called
     if (document.hidden || !canvas || !canvas.parentElement) return;
 
+    animFrameId = requestAnimationFrame(loop);
+    const now = performance.now();
+    if (now - lastFrameTime < FRAME_INTERVAL_MS) return;
+    lastFrameTime = now;
+
     // Resize canvas if needed — note: resizing resets the canvas bitmap,
     // which is fine since it also clears any phosphor trail during layout changes.
     const rect = canvas.parentElement.getBoundingClientRect();
@@ -113,7 +123,6 @@ function startAnimation(canvas: HTMLCanvasElement, appState: AppState) {
     }
 
     drawOscilloscope(ctx, canvas.width, canvas.height, appState);
-    animFrameId = requestAnimationFrame(loop);
   }
 
   // Page Visibility API — pause when window is hidden, resume on restore
@@ -201,6 +210,12 @@ const view: ViewModule = {
     }
 
     this.updateState?.(state);
+
+    // Repaint the uptime cell every second (main.ts ticks state.uptimeS)
+    uptimeTimer = window.setInterval(() => {
+      const uptimeVal = containerElement?.querySelector('#uptime-val');
+      if (uptimeVal) uptimeVal.textContent = formatUptime(state.uptimeS);
+    }, 1000);
   },
 
   updateState(state: AppState) {
@@ -254,6 +269,10 @@ const view: ViewModule = {
     if (visibilityHandler) {
       document.removeEventListener('visibilitychange', visibilityHandler);
       visibilityHandler = null;
+    }
+    if (uptimeTimer !== null) {
+      clearInterval(uptimeTimer);
+      uptimeTimer = null;
     }
     containerElement = null;
   }

@@ -8,6 +8,8 @@ and orchestrates the full pipeline:
 
 Security notes:
   - CORS is locked to Tauri origins only (not wildcard).
+  - Requests carrying a foreign Origin header are rejected outright (CORS alone
+    only hides the response; the request would still run).
   - ollama_url is validated to loopback-only in config.py.
   - Transcript content is never logged at INFO level (privacy).
   - Trigger endpoints are rate-limited to 1 request per 500ms.
@@ -31,6 +33,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from config import Config, load_config, update_config
 from core_llm import OllamaClient
@@ -56,8 +59,10 @@ WHISPER_MODEL_SIZES = [
     "tiny", "base", "small", "medium",
     "large-v2", "large-v3",
     "large-v3-turbo",
-    "distil-large-v3",
 ]
+
+# Whisper models that were not trained on the translate task
+_NO_TRANSLATE_MODELS = {"large-v3-turbo", "distil-large-v3"}
 
 # Rate limiting: minimum seconds between trigger requests
 _TRIGGER_COOLDOWN_S = 0.5
@@ -211,13 +216,41 @@ app = FastAPI(
 
 # CORS: locked to Tauri's internal origin only.
 # Previously allow_origins=["*"] — that allowed any browser page to control the daemon.
+_ALLOWED_ORIGINS = ["tauri://localhost", "http://localhost:1420"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["tauri://localhost", "http://localhost:1420"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+class _OriginGuard:
+    """
+    Reject any request whose Origin header is not the Tauri UI.
+    Browsers always send Origin on cross-site POSTs, so this stops web pages
+    from triggering the mic or changing settings. Requests without an Origin
+    (curl from a compositor keybind) are allowed.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            origin = dict(scope["headers"]).get(b"origin")
+            if origin is not None and origin.decode("latin-1") not in _ALLOWED_ORIGINS:
+                response = JSONResponse({"detail": "Origin not allowed"}, status_code=403)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_OriginGuard)
+# Host check defeats DNS-rebinding (a foreign hostname resolving to 127.0.0.1)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
 
 # --------------------------------------------------------------------------- #
 # Debug Endpoints (only registered when ZOLA_DEBUG=1)
@@ -263,6 +296,17 @@ def _check_rate_limit() -> None:
     _last_trigger_time = now
 
 
+async def _open_mic(request: Request, audio_path: Path) -> None:
+    """Start the recorder; if the mic cannot be opened, undo the recording state."""
+    try:
+        request.app.state.recorder.start(audio_path)
+    except Exception as exc:
+        await _state(request).stop_recording()
+        audio_path.unlink(missing_ok=True)
+        broadcast_event("state_change", _state(request).get_status())
+        raise HTTPException(status_code=503, detail=f"Could not open microphone: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # SSE Clients Registry
 # --------------------------------------------------------------------------- #
@@ -284,7 +328,7 @@ def broadcast_event(event_type: str, data: dict) -> None:
 # --------------------------------------------------------------------------- #
 @app.post("/trigger", summary="Toggle the configured active transcription mode")
 async def trigger_active_mode(request: Request) -> JSONResponse:
-    _check_rate_limit()
+    # Rate limiting is done by the mode handler this dispatches to.
     cfg = _cfg(request)
     mode = cfg.active_mode or "batch"
     if mode == "realtime":
@@ -317,7 +361,7 @@ async def trigger_realtime(request: Request) -> JSONResponse:
         )
 
     audio_path = await app_state.start_recording(RecordingMode.REALTIME)
-    request.app.state.recorder.start(audio_path)
+    await _open_mic(request, audio_path)
     broadcast_event("state_change", app_state.get_status())
 
     task = asyncio.create_task(_realtime_loop(request), name="realtime-stt-loop")
@@ -341,7 +385,7 @@ async def trigger_realtime_llm(request: Request) -> JSONResponse:
         )
 
     audio_path = await app_state.start_recording(RecordingMode.REALTIME_LLM)
-    request.app.state.recorder.start(audio_path)
+    await _open_mic(request, audio_path)
     broadcast_event("state_change", app_state.get_status())
 
     task = asyncio.create_task(_realtime_loop(request), name="realtime-llm-stt-loop")
@@ -365,7 +409,7 @@ async def trigger_batch(request: Request) -> JSONResponse:
         )
 
     audio_path = await app_state.start_recording(RecordingMode.BATCH)
-    request.app.state.recorder.start(audio_path)
+    await _open_mic(request, audio_path)
     broadcast_event("state_change", app_state.get_status())
 
     task = asyncio.create_task(
@@ -391,7 +435,7 @@ async def trigger_batch_llm(request: Request) -> JSONResponse:
         )
 
     audio_path = await app_state.start_recording(RecordingMode.BATCH_LLM)
-    request.app.state.recorder.start(audio_path)
+    await _open_mic(request, audio_path)
     broadcast_event("state_change", app_state.get_status())
 
     task = asyncio.create_task(
@@ -420,6 +464,14 @@ async def trigger_batch_translate(request: Request) -> JSONResponse:
     _check_rate_limit()
     app_state = _state(request)
 
+    if _cfg(request).whisper_batch in _NO_TRANSLATE_MODELS:
+        logger.warning(
+            "batch-translate: model '%s' cannot translate and will output the "
+            "spoken language. Use small/medium/large-v3, or batch-llm with "
+            "output_language=english.",
+            _cfg(request).whisper_batch,
+        )
+
     if app_state.is_recording and app_state.active_mode == RecordingMode.BATCH_TRANSLATE:
         request.app.state.recorder.request_stop()
         return JSONResponse({"status": "stopping", "mode": "batch-translate"})
@@ -431,7 +483,7 @@ async def trigger_batch_translate(request: Request) -> JSONResponse:
         )
 
     audio_path = await app_state.start_recording(RecordingMode.BATCH_TRANSLATE)
-    request.app.state.recorder.start(audio_path)
+    await _open_mic(request, audio_path)
     broadcast_event("state_change", app_state.get_status())
 
     task = asyncio.create_task(
@@ -512,6 +564,9 @@ async def post_settings(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     cfg = _cfg(request)
+    stt: WhisperEngine = request.app.state.stt
+    engine_keys = ("whisper_realtime", "whisper_batch", "cpu_threads", "compute_type")
+    previous = {k: getattr(cfg, k) for k in engine_keys}
 
     try:
         changed_keys = update_config(cfg, body)
@@ -520,25 +575,29 @@ async def post_settings(request: Request) -> JSONResponse:
 
     reloaded: list[str] = []
 
-    if "whisper_realtime" in changed_keys:
-        try:
-            await request.app.state.stt.hot_reload("realtime", cfg.whisper_realtime)
+    # cpu_threads / compute_type only take effect on a freshly loaded model
+    engine_changed = bool(changed_keys & {"cpu_threads", "compute_type"})
+    try:
+        if "whisper_realtime" in changed_keys or engine_changed:
+            await stt.hot_reload("realtime", cfg.whisper_realtime, fresh=engine_changed)
             reloaded.append("whisper_realtime")
-        except Exception as exc:
-            logger.error("Failed to hot-reload realtime model: %s", exc)
-            raise HTTPException(status_code=500, detail=f"Model reload failed: {exc}")
-
-    if "whisper_batch" in changed_keys:
-        try:
-            await request.app.state.stt.hot_reload("batch", cfg.whisper_batch)
+        if "whisper_batch" in changed_keys or engine_changed:
+            await stt.hot_reload("batch", cfg.whisper_batch)
             reloaded.append("whisper_batch")
-        except Exception as exc:
-            logger.error("Failed to hot-reload batch model: %s", exc)
-            raise HTTPException(status_code=500, detail=f"Model reload failed: {exc}")
+    except Exception as exc:
+        logger.error("Model reload failed: %s — restoring previous models", exc)
+        update_config(cfg, previous)
+        await stt.hot_reload("realtime", cfg.whisper_realtime, fresh=True)
+        await stt.hot_reload("batch", cfg.whisper_batch)
+        raise HTTPException(status_code=500, detail=f"Model reload failed: {exc}")
 
     if "ollama_model" in changed_keys:
         request.app.state.llm.model_name = cfg.ollama_model
         reloaded.append("ollama_model")
+
+    if "ollama_url" in changed_keys:
+        request.app.state.llm.set_base_url(cfg.ollama_url)
+        reloaded.append("ollama_url")
 
     if "output_language" in changed_keys:
         request.app.state.llm.output_language = cfg.output_language
@@ -600,16 +659,17 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
     logger.info("Batch pipeline started (mode=%s)", mode.value)
 
     audio_path = None
+    stopped = False  # once True, the recorder may already belong to a newer session
     try:
         await recorder.monitor_until_silence(
             silence_timeout_s=cfg.batch_silence_timeout_s,
-            silence_rms_threshold=cfg.silence_rms_threshold,
             min_record_s=cfg.batch_min_record_s,
             max_record_duration_s=cfg.max_record_duration_s,
         )
 
         audio_path, duration_s = recorder.stop()
         await app_state.stop_recording()
+        stopped = True
         broadcast_event("state_change", app_state.get_status())
 
         if duration_s < 0.3:
@@ -639,18 +699,17 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
             final_transcript = await llm.format_transcript(raw_transcript)
 
         if final_transcript:
-            # Primary: clipboard paste (Unicode-safe, works for Devanagari)
+            # Clipboard paste (Unicode-safe, works for Devanagari). The text
+            # stays in the clipboard afterwards for manual paste if needed.
             await injector.inject_text(final_transcript, cfg.typing_delay_ms)
-            # Session-end clipboard update (for manual paste if needed)
-            asyncio.create_task(injector.copy_to_clipboard(final_transcript))
 
-        await app_state.add_history(mode, final_transcript, duration_s)
-        broadcast_event("new_transcript", {
-            "transcript": final_transcript,
-            "mode": mode.value,
-            "duration_s": round(duration_s, 2),
-            "session_transcript": final_transcript,
-        })
+            await app_state.add_history(mode, final_transcript, duration_s)
+            broadcast_event("new_transcript", {
+                "transcript": final_transcript,
+                "mode": mode.value,
+                "duration_s": round(duration_s, 2),
+                "session_transcript": final_transcript,
+            })
 
         logger.info(
             "Batch pipeline complete — %.1fs audio, %.1fs total, chars=%d",
@@ -659,22 +718,22 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
 
     except asyncio.CancelledError:
         logger.info("Batch pipeline cancelled")
-        audio_path_cancel, _ = recorder.stop()
-        audio_path = audio_path or audio_path_cancel
-        try:
-            await app_state.stop_recording()
-            broadcast_event("state_change", app_state.get_status())
-        except Exception as b_err:
-            logger.debug("Broadcast cancellation state change ignored: %s", b_err)
+        if not stopped:
+            audio_path, _ = recorder.stop()
+            try:
+                await app_state.stop_recording()
+                broadcast_event("state_change", app_state.get_status())
+            except Exception as b_err:
+                logger.debug("Broadcast cancellation state change ignored: %s", b_err)
     except Exception as exc:
         logger.exception("Batch pipeline error: %s", exc)
-        audio_path_err, _ = recorder.stop()
-        audio_path = audio_path or audio_path_err
-        try:
-            await app_state.stop_recording()
-            broadcast_event("state_change", app_state.get_status())
-        except Exception as b_err:
-            logger.debug("Broadcast error state change ignored: %s", b_err)
+        if not stopped:
+            audio_path, _ = recorder.stop()
+            try:
+                await app_state.stop_recording()
+                broadcast_event("state_change", app_state.get_status())
+            except Exception as b_err:
+                logger.debug("Broadcast error state change ignored: %s", b_err)
     finally:
         # Clean up the per-session temp audio file
         if audio_path and Path(audio_path).exists():
@@ -715,7 +774,6 @@ async def _realtime_loop(request: Request) -> None:
         async for utterance_audio in recorder.stream_utterances(
             utterance_silence_s=cfg.realtime_utterance_silence_s,
             force_commit_s=cfg.realtime_force_commit_s,
-            silence_rms_threshold=cfg.silence_rms_threshold,
             chunk_s=cfg.realtime_chunk_s,
             realtime_silence_timeout_s=cfg.realtime_silence_timeout_s,
             max_record_duration_s=cfg.max_record_duration_s,

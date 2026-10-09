@@ -142,8 +142,11 @@ function handleSSEEvent(event: any) {
       state.latestTranscript = transcriptData.transcript;
     }
 
-    // Accumulate total character injected count
-    if (transcriptData.transcript) {
+    // Accumulate total character injected count. A realtime session ends with a
+    // summary event (duration_s > 0) repeating text already counted per utterance.
+    const isRealtimeSummary =
+      String(transcriptData.mode).startsWith('realtime') && transcriptData.duration_s > 0;
+    if (transcriptData.transcript && !isRealtimeSummary) {
       state.charsInjected += transcriptData.transcript.length;
     }
 
@@ -221,6 +224,11 @@ async function bootstrap() {
   } catch (err) {
     console.error('Failed to fetch config for onboarding check', err);
   }
+
+  // The daemon only reports uptime on state changes; tick locally in between
+  window.setInterval(() => {
+    if (state.connected) state.uptimeS += 1;
+  }, 1000);
 
   // Start listening to the SSE stream
   api.listenToEvents(

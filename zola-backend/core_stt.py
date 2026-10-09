@@ -8,6 +8,8 @@ Two models are kept resident in RAM simultaneously:
   - 'realtime' model (default: base, int8)          → ~150MB RAM
   - 'batch'    model (default: small, int8)           → ~500MB RAM
 
+If both slots name the same model, one instance is shared.
+
 Hot-reload swaps one model at a time under an asyncio.Lock.
 Transcription methods snapshot the model reference under the lock
 to prevent a race condition where hot_reload() deletes the old
@@ -30,6 +32,7 @@ from typing import Union
 import numpy as np
 from scipy.io import wavfile
 from faster_whisper import WhisperModel
+from faster_whisper.vad import VadOptions
 
 from config import Config
 
@@ -48,6 +51,13 @@ HINGLISH_PROMPT = (
 # hallucinating.  Smaller models (tiny, base, small) produce >100% WER
 # when prompted with mixed-script text.
 _HINGLISH_SAFE_MODELS = {"large-v3-turbo", "large-v3", "large-v2", "medium"}
+
+_VAD_PARAMS = VadOptions(
+    min_silence_duration_ms=300,  # tighter — less clipping
+    speech_pad_ms=100,
+    threshold=0.4,                # more sensitive for Hindi
+    min_speech_duration_ms=200,   # ignore sub-200ms noise
+)
 
 class WhisperEngine:
     """
@@ -69,10 +79,15 @@ class WhisperEngine:
             config.cpu_threads,
         )
 
+        self._names = {"realtime": config.whisper_realtime, "batch": config.whisper_batch}
+
         t0 = time.monotonic()
         self._realtime: WhisperModel = self._load_model(config.whisper_realtime)
         t1 = time.monotonic()
-        self._batch: WhisperModel = self._load_model(config.whisper_batch)
+        self._batch: WhisperModel = (
+            self._realtime if config.whisper_batch == config.whisper_realtime
+            else self._load_model(config.whisper_batch)
+        )
         t2 = time.monotonic()
 
         logger.info(
@@ -110,30 +125,39 @@ class WhisperEngine:
         logger.info("WhisperEngine: model '%s' downloaded and cached", size)
         return model
 
-    async def hot_reload(self, slot: str, new_model_name: str) -> None:
+    async def hot_reload(self, slot: str, new_model_name: str, fresh: bool = False) -> None:
         """
         Safely swap the model in `slot` ('realtime' or 'batch') for a new one.
-        Blocks all transcription during the swap via asyncio.Lock.
+        The old model is released before the new one is loaded so two large
+        models are never resident at once; the slot is None during the load
+        and stays None if the load fails (the caller reloads the old model).
+        fresh=True always loads a new instance (cpu_threads/compute_type changed)
+        instead of sharing the other slot's model.
         """
         if slot not in ("realtime", "batch"):
             raise ValueError(f"Invalid slot '{slot}'. Must be 'realtime' or 'batch'.")
 
         logger.info("WhisperEngine: hot-reload slot='%s' → '%s'", slot, new_model_name)
         loop = asyncio.get_event_loop()
+        other = "batch" if slot == "realtime" else "realtime"
 
         async with self._lock:
-            new_model: WhisperModel = await loop.run_in_executor(
-                None, self._load_model, new_model_name
-            )
             attr = f"_{slot}"
-            old_model = getattr(self, attr)
-            setattr(self, attr, new_model)
-            del old_model
+            setattr(self, attr, None)
+            self._names[slot] = None
             gc.collect()
 
+            if not fresh and new_model_name == self._names[other]:
+                new_model = getattr(self, f"_{other}")
+            else:
+                new_model = await loop.run_in_executor(
+                    None, self._load_model, new_model_name
+                )
+            setattr(self, attr, new_model)
+            self._names[slot] = new_model_name
+
             logger.info(
-                "WhisperEngine: slot='%s' swapped to '%s', old model freed",
-                slot, new_model_name,
+                "WhisperEngine: slot='%s' swapped to '%s'", slot, new_model_name,
             )
 
     # ----------------------------------------------------------------------- #
@@ -178,18 +202,23 @@ class WhisperEngine:
         combined = " ".join(parts).strip()
         return combined if combined else None
 
-    def _get_whisper_language(self) -> str | None:
+    def _resolve_language(self, model: WhisperModel, audio: np.ndarray) -> str:
         """
-        Resolve the Whisper language parameter from config.
-        spoken_language takes priority over the legacy language field.
+        Resolve the Whisper language for this audio.
+        spoken_language 'en'/'hi' (or the legacy language field) is used as-is.
+        For 'auto'/'mixed' the choice is restricted to Hindi or English, so short
+        Hinglish utterances are never transcribed as Urdu/Bengali/Punjabi.
         """
         spoken = self._config.spoken_language
-        if spoken == "en":
-            return "en"
-        if spoken == "hi":
-            return "hi"
-        # "auto", "mixed", and the legacy language=None all map to auto-detect
-        return self._config.language  # None = auto-detect
+        if spoken in ("en", "hi"):
+            return spoken
+        if self._config.language not in (None, "auto"):
+            return self._config.language
+        _, _, all_probs = model.detect_language(
+            audio, vad_filter=True, vad_parameters=_VAD_PARAMS,
+        )
+        probs = dict(all_probs)
+        return "hi" if probs.get("hi", 0.0) > probs.get("en", 0.0) else "en"
 
     # ----------------------------------------------------------------------- #
     # Transcription (synchronous — run in ThreadPoolExecutor)
@@ -201,13 +230,6 @@ class WhisperEngine:
         Thread safety: snapshots the model reference under the asyncio.Lock
         before releasing it, so hot_reload() cannot delete the model mid-call.
         """
-        # Snapshot model reference under lock (prevents hot-reload race)
-        import asyncio as _asyncio
-        try:
-            _ = _asyncio.get_event_loop()
-        except RuntimeError:
-            pass
-
         # We are in a ThreadPoolExecutor — get model reference safely.
         # Since asyncio.Lock is not thread-safe, we use the fact that
         # Python attribute reads are atomic in CPython (GIL protected).
@@ -217,14 +239,10 @@ class WhisperEngine:
             self._config.whisper_realtime if mode == "realtime"
             else self._config.whisper_batch
         )
-        chunk_s = (
-            self._config.realtime_chunk_s if mode == "realtime"
-            else self._config.batch_chunk_s
-        )
 
         logger.debug(
-            "WhisperEngine.transcribe_file: model='%s', chunk_s=%.1fs, path=%s",
-            model_name, chunk_s, audio_path,
+            "WhisperEngine.transcribe_file: model='%s', path=%s",
+            model_name, audio_path,
         )
         t0 = time.monotonic()
 
@@ -232,45 +250,21 @@ class WhisperEngine:
             sample_rate, data = wavfile.read(str(audio_path))
             audio = data.astype(np.float32) / 32768.0
 
-            chunk_size = int(sample_rate * chunk_s)
-            transcripts = []
-            prev_text = ""
-
-            for i in range(0, len(audio), chunk_size):
-                chunk = audio[i: i + chunk_size]
-                if len(chunk) < int(sample_rate * 0.3):
-                    continue
-
-                rms = float(np.sqrt(np.mean(chunk ** 2)))
-                if rms < self._config.silence_rms_threshold:
-                    continue
-
-                initial_prompt = self._build_initial_prompt(prev_text, mode=mode)
-                whisper_lang = self._get_whisper_language()
-
-                segments, info = model.transcribe(
-                    chunk,
-                    language=whisper_lang,
-                    task="transcribe",
-                    beam_size=5,
-                    best_of=5,
-                    vad_filter=True,
-                    vad_parameters={
-                        "min_silence_duration_ms": 300,  # tighter — less clipping
-                        "speech_pad_ms": 100,
-                        "threshold": 0.4,               # more sensitive for Hindi
-                        "min_speech_duration_ms": 200,  # ignore sub-200ms noise
-                    },
-                    no_speech_threshold=0.5,
-                    initial_prompt=initial_prompt,
-                    condition_on_previous_text=bool(prev_text),
-                )
-                chunk_text = _join_segments(segments)
-                if chunk_text:
-                    transcripts.append(chunk_text)
-                    prev_text = chunk_text
-
-            transcript = " ".join(transcripts)
+            # One call for the whole recording: Whisper windows it internally,
+            # so no word is split at an arbitrary chunk boundary.
+            segments, info = model.transcribe(
+                audio,
+                language=self._resolve_language(model, audio),
+                task="transcribe",
+                beam_size=5,
+                best_of=5,
+                vad_filter=True,
+                vad_parameters=_VAD_PARAMS,
+                no_speech_threshold=0.5,
+                initial_prompt=self._build_initial_prompt(mode=mode),
+                condition_on_previous_text=False,
+            )
+            transcript = _join_segments(segments)
             elapsed = time.monotonic() - t0
             audio_duration = len(audio) / sample_rate
             rtf = elapsed / audio_duration if audio_duration > 0 else 0.0
@@ -281,7 +275,7 @@ class WhisperEngine:
                 audio_duration, elapsed, rtf, len(transcript),
             )
 
-            del audio, transcripts
+            del audio
             gc.collect()
             return transcript
 
@@ -304,29 +298,19 @@ class WhisperEngine:
         if len(audio) < sample_rate * 0.2:
             return ""
 
-        rms = float(np.sqrt(np.mean(audio ** 2)))
-        if rms < self._config.silence_rms_threshold:
-            return ""
-
         # Atomic snapshot of realtime model reference (GIL-protected)
         model = self._realtime
         initial_prompt = self._build_initial_prompt(prev_text, mode="realtime")
-        whisper_lang = self._get_whisper_language()
 
         try:
             segments, info = model.transcribe(
                 audio,
-                language=whisper_lang,
+                language=self._resolve_language(model, audio),
                 task="transcribe",
                 beam_size=1,
                 best_of=1,
                 vad_filter=True,
-                vad_parameters={
-                    "min_silence_duration_ms": 300,
-                    "speech_pad_ms": 100,
-                    "threshold": 0.4,
-                    "min_speech_duration_ms": 200,
-                },
+                vad_parameters=_VAD_PARAMS,
                 no_speech_threshold=0.5,
                 initial_prompt=initial_prompt,
                 condition_on_previous_text=bool(prev_text),
@@ -366,47 +350,21 @@ class WhisperEngine:
             sample_rate, data = wavfile.read(str(audio_path))
             audio = data.astype(np.float32) / 32768.0
 
-            chunk_size = int(sample_rate * self._config.batch_chunk_s)
-            transcripts = []
-            prev_text = ""
-            info = None
-
-            for i in range(0, len(audio), chunk_size):
-                chunk = audio[i: i + chunk_size]
-                if len(chunk) < int(sample_rate * 0.3):
-                    continue
-
-                rms = float(np.sqrt(np.mean(chunk ** 2)))
-                if rms < self._config.silence_rms_threshold:
-                    continue
-
-                initial_prompt = self._build_initial_prompt(prev_text, mode="translate")
-
-                segments, info = model.transcribe(
-                    chunk,
-                    language=self._get_whisper_language(),
-                    task="translate",          # ← Whisper translates to English
-                    beam_size=5,
-                    best_of=5,
-                    vad_filter=True,
-                    vad_parameters={
-                        "min_silence_duration_ms": 300,
-                        "speech_pad_ms": 100,
-                        "threshold": 0.4,
-                        "min_speech_duration_ms": 200,
-                    },
-                    initial_prompt=initial_prompt,
-                    condition_on_previous_text=bool(prev_text),
-                )
-                chunk_text = _join_segments(segments)
-                if chunk_text:
-                    transcripts.append(chunk_text)
-                    prev_text = chunk_text
-
-            transcript = " ".join(transcripts)
+            segments, info = model.transcribe(
+                audio,
+                language=self._resolve_language(model, audio),
+                task="translate",          # ← Whisper translates to English
+                beam_size=5,
+                best_of=5,
+                vad_filter=True,
+                vad_parameters=_VAD_PARAMS,
+                initial_prompt=self._build_initial_prompt(mode="translate"),
+                condition_on_previous_text=False,
+            )
+            transcript = _join_segments(segments)
             elapsed = time.monotonic() - t0
             audio_duration = len(audio) / sample_rate
-            detected_lang = getattr(info, "language", "unknown") if info is not None else "unknown"
+            detected_lang = info.language
             logger.info(
                 "WhisperEngine.translate_file: %.1fs audio → %.1fs inference, "
                 "chars=%d (source lang detected: %s)",

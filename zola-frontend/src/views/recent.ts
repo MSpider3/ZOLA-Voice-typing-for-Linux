@@ -225,7 +225,7 @@ const RecentView: ViewModule = {
       currentText = state.latestTranscript;
       currentMode = state.activeMode || 'REALTIME';
       currentTimestamp = 'LIVE_STREAMING';
-      currentDuration = state.uptimeS;
+      currentDuration = 0; // not known until the session ends
       isRefined = currentMode.endsWith('-llm');
     } else if (state.latestTranscript && state.latestTranscript !== 'AWAITING_INPUT' && state.latestTranscript !== 'NO_TRANSCRIPTION_LOADED') {
       currentText = state.latestTranscript;
@@ -250,7 +250,7 @@ const RecentView: ViewModule = {
       currentText = state.latestTranscript;
       currentMode = state.activeMode || 'REALTIME';
       currentTimestamp = 'LIVE_STREAMING';
-      currentDuration = state.uptimeS;
+      currentDuration = 0; // not known until the session ends
       isRefined = currentMode.endsWith('-llm');
     } else if (!state.isRecording && state.latestTranscript && state.latestTranscript !== 'AWAITING_INPUT' && state.latestTranscript !== 'NO_TRANSCRIPTION_LOADED') {
       currentText = state.latestTranscript;

@@ -28,11 +28,16 @@ from typing import AsyncGenerator
 
 import numpy as np
 import sounddevice as sd
+from faster_whisper.vad import get_vad_model
 from scipy.io import wavfile
 
 logger = logging.getLogger(__name__)
 
 _ZOLA_DEBUG = os.environ.get("ZOLA_DEBUG") == "1"
+
+_VAD_WINDOW = 512        # Silero VAD frame size at 16 kHz
+_VAD_SPEECH_PROB = 0.5   # speech probability above which a frame counts as speech
+_VAD_CONTEXT_FRAMES = 5  # 100 ms mic blocks fed to the VAD per decision (0.5 s)
 
 
 class AudioRecorder:
@@ -60,6 +65,9 @@ class AudioRecorder:
 
         # Per-session temp path — set by start(), used by stop()
         self._audio_path: Path | None = None
+
+        # Silero VAD (bundled with faster-whisper) — decides speech vs silence
+        self._vad = get_vad_model()
 
         logger.info(
             "AudioRecorder: ready (mic opens only during recording, "
@@ -166,7 +174,8 @@ class AudioRecorder:
 
         with self._buffer_lock:
             if not self._buffer:
-                logger.warning("AudioRecorder.stop(): no audio — writing silence placeholder")
+                # Normal for realtime sessions, which do not keep the session audio
+                logger.debug("AudioRecorder.stop(): no audio — writing silence placeholder")
                 _write_wav(audio_path, self.sample_rate,
                            np.zeros(self.sample_rate, dtype=np.float32))
                 return audio_path, duration_s
@@ -201,6 +210,15 @@ class AudioRecorder:
             finally:
                 self._stream = None
 
+    def _is_speech(self, frames: list[np.ndarray]) -> bool:
+        """True if the newest ~0.1 s of `frames` (recent mic blocks) contains speech."""
+        audio = np.concatenate(frames).flatten()
+        audio = audio[len(audio) % _VAD_WINDOW:]
+        if len(audio) == 0:
+            return False
+        probs = self._vad(audio)
+        return float(np.max(probs[-4:])) >= _VAD_SPEECH_PROB
+
     # ----------------------------------------------------------------------- #
     # Realtime: VAD-segmented utterance generator
     # ----------------------------------------------------------------------- #
@@ -208,7 +226,6 @@ class AudioRecorder:
         self,
         utterance_silence_s: float = 0.7,
         force_commit_s: float = 10.0,
-        silence_rms_threshold: float = 0.02,
         chunk_s: float = 2.0,
         realtime_silence_timeout_s: float = 3.0,
         max_record_duration_s: float = 300.0,
@@ -217,13 +234,17 @@ class AudioRecorder:
         Async generator that yields complete utterance audio arrays.
 
         Yields each utterance when silence >= utterance_silence_s or
-        force_commit_s is reached. Hard-stops at max_record_duration_s
-        to prevent unbounded buffer growth (RAM safety cap).
+        force_commit_s is reached. Hard-stops at max_record_duration_s.
+
+        Silence is measured in audio time (per mic block), not wall-clock time,
+        so a slow transcription of the previous utterance cannot be mistaken
+        for the user having stopped speaking.
         """
         utterance_buf: list[np.ndarray] = []
         utterance_samples = 0
-        silence_since: float | None = None
-        utterance_start = time.monotonic()
+        has_speech = False
+        silence_s = 0.0
+        recent: list[np.ndarray] = []
 
         vad_enabled = utterance_silence_s > 0.0
         limit_s = force_commit_s if vad_enabled else chunk_s
@@ -231,16 +252,13 @@ class AudioRecorder:
 
         logger.info(
             "AudioRecorder: utterance stream started "
-            "(vad=%.1fs, limit_s=%.1fs, timeout=%.1fs, rms=%.3f, max_dur=%.0fs)",
+            "(vad=%.1fs, limit_s=%.1fs, timeout=%.1fs, max_dur=%.0fs)",
             utterance_silence_s if vad_enabled else 0.0,
-            limit_s, realtime_silence_timeout_s,
-            silence_rms_threshold, max_record_duration_s,
+            limit_s, realtime_silence_timeout_s, max_record_duration_s,
         )
 
         try:
-            while self._is_recording:
-                await asyncio.sleep(0.05)
-
+            while True:
                 # ── Hard cap: prevent runaway RAM accumulation ──
                 elapsed = time.monotonic() - self._session_start
                 if max_record_duration_s > 0 and elapsed >= max_record_duration_s:
@@ -251,41 +269,27 @@ class AudioRecorder:
                     self._is_recording = False
                     break
 
-                # Drain queue into utterance buffer + session buffer
-                frames_this_tick: list[np.ndarray] = []
-                while True:
-                    try:
-                        frame = self._queue.get_nowait()
-                        frames_this_tick.append(frame)
-                        utterance_buf.append(frame.copy())
-                        utterance_samples += len(frame)
-                        with self._buffer_lock:
-                            self._buffer.append(frame)
-                    except queue.Empty:
+                try:
+                    frame = self._queue.get_nowait()
+                except queue.Empty:
+                    # After a stop request, finish the frames already captured
+                    if not self._is_recording:
                         break
-
-                if not frames_this_tick:
+                    await asyncio.sleep(0.05)
                     continue
 
-                # RMS over rolling 0.5-second window
-                with self._buffer_lock:
-                    recent_frames = self._buffer[-5:] if len(self._buffer) >= 5 else self._buffer
-                    if recent_frames:
-                        recent_audio = np.concatenate(recent_frames).flatten()
-                        rms = float(np.sqrt(np.mean(recent_audio ** 2)))
-                    else:
-                        rms = 0.0
+                utterance_buf.append(frame)
+                utterance_samples += len(frame)
+                recent = (recent + [frame])[-_VAD_CONTEXT_FRAMES:]
 
-                if rms < silence_rms_threshold:
-                    if silence_since is None:
-                        silence_since = time.monotonic()
+                if self._is_speech(recent):
+                    silence_s = 0.0
+                    has_speech = True
                 else:
-                    silence_since = None
+                    silence_s += len(frame) / self.sample_rate
 
                 # Auto-stop on long silence
-                if (silence_since is not None
-                        and realtime_silence_timeout_s > 0.0
-                        and (time.monotonic() - silence_since) >= realtime_silence_timeout_s):
+                if realtime_silence_timeout_s > 0.0 and silence_s >= realtime_silence_timeout_s:
                     logger.info(
                         "AudioRecorder: realtime auto-stop — %.1fs silence",
                         realtime_silence_timeout_s,
@@ -294,29 +298,38 @@ class AudioRecorder:
                     break
 
                 # VAD: utterance boundary commit
-                if vad_enabled:
-                    if (silence_since is not None
-                            and (time.monotonic() - silence_since) >= utterance_silence_s
-                            and utterance_samples >= int(self.sample_rate * 0.3)):
+                if vad_enabled and silence_s >= utterance_silence_s:
+                    if has_speech:
                         utterance = np.concatenate(utterance_buf, axis=0).flatten()
                         logger.debug(
-                            "Utterance committed via VAD (%.2fs speech)",
-                            time.monotonic() - utterance_start,
+                            "Utterance committed via VAD (%.2fs)",
+                            utterance_samples / self.sample_rate,
                         )
                         utterance_buf.clear()
                         utterance_samples = 0
-                        utterance_start = time.monotonic()
+                        has_speech = False
                         yield utterance
-                        continue
+                    else:
+                        # Nothing spoken yet: keep a short pre-roll so the next
+                        # word onset is not clipped, drop the rest.
+                        del utterance_buf[:-_VAD_CONTEXT_FRAMES]
+                        utterance_samples = sum(len(f) for f in utterance_buf)
+                    continue
 
                 # Force-commit: max utterance duration
                 if force_samples and utterance_samples >= force_samples:
-                    utterance = np.concatenate(utterance_buf, axis=0).flatten()
-                    logger.debug("Utterance committed via force-commit (%.1fs)", force_commit_s)
-                    utterance_buf.clear()
-                    utterance_samples = 0
-                    silence_since = None
-                    utterance_start = time.monotonic()
+                    cut = len(utterance_buf)
+                    if vad_enabled:
+                        # Cut at the quietest block of the last second, not mid-word
+                        tail = utterance_buf[-10:]
+                        quietest = min(
+                            range(len(tail)), key=lambda i: float(np.mean(tail[i] ** 2))
+                        )
+                        cut = len(utterance_buf) - len(tail) + quietest + 1
+                    utterance = np.concatenate(utterance_buf[:cut], axis=0).flatten()
+                    logger.debug("Utterance committed via force-commit (%.1fs)", limit_s)
+                    del utterance_buf[:cut]
+                    utterance_samples = sum(len(f) for f in utterance_buf)
                     yield utterance
 
         except asyncio.CancelledError:
@@ -324,7 +337,8 @@ class AudioRecorder:
             self._is_recording = False
 
         # Yield any remaining partial utterance
-        if utterance_buf and utterance_samples >= int(self.sample_rate * 0.3):
+        if (utterance_buf and utterance_samples >= int(self.sample_rate * 0.3)
+                and (has_speech or not vad_enabled)):
             yield np.concatenate(utterance_buf, axis=0).flatten()
 
         logger.debug("AudioRecorder: stream_utterances finished")
@@ -335,7 +349,6 @@ class AudioRecorder:
     async def monitor_until_silence(
         self,
         silence_timeout_s: float = 3.0,
-        silence_rms_threshold: float = 0.02,
         min_record_s: float = 0.5,
         max_record_duration_s: float = 300.0,
     ) -> None:
@@ -372,8 +385,8 @@ class AudioRecorder:
 
         logger.info(
             "AudioRecorder: batch silence monitor armed "
-            "(timeout=%.1fs, rms=%.3f, max_dur=%.0fs)",
-            silence_timeout_s, silence_rms_threshold, max_record_duration_s,
+            "(timeout=%.1fs, max_dur=%.0fs)",
+            silence_timeout_s, max_record_duration_s,
         )
 
         try:
@@ -407,14 +420,9 @@ class AudioRecorder:
                     continue
 
                 with self._buffer_lock:
-                    recent_frames = self._buffer[-5:] if len(self._buffer) >= 5 else self._buffer
-                    if recent_frames:
-                        recent_audio = np.concatenate(recent_frames).flatten()
-                        rms = float(np.sqrt(np.mean(recent_audio ** 2)))
-                    else:
-                        rms = 0.0
+                    recent_frames = self._buffer[-_VAD_CONTEXT_FRAMES:]
 
-                if rms < silence_rms_threshold:
+                if not self._is_speech(recent_frames):
                     if silence_since is None:
                         silence_since = time.monotonic()
                     elif (time.monotonic() - silence_since) >= silence_timeout_s:

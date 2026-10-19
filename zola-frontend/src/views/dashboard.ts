@@ -48,7 +48,8 @@ function drawOscilloscope(ctx: CanvasRenderingContext2D, width: number, height: 
   if (appState.connected) {
     if (appState.isRecording) {
       lineColor = '#ffb000'; // recording: amber
-      amplitude = 35;
+      // Real mic peak level drives the trace (quiet laptop mics peak ~0.05)
+      amplitude = 3 + Math.min(1, appState.micLevel * 8) * 60;
     }
     // else: idle green stays
   } else {
@@ -123,6 +124,7 @@ function startAnimation(canvas: HTMLCanvasElement, appState: AppState) {
     }
 
     drawOscilloscope(ctx, canvas.width, canvas.height, appState);
+    updateMicLevel(appState);
   }
 
   // Page Visibility API — pause when window is hidden, resume on restore
@@ -147,6 +149,20 @@ function startAnimation(canvas: HTMLCanvasElement, appState: AppState) {
   document.addEventListener('visibilitychange', visibilityHandler);
 
   loop();
+}
+
+/** MIC_LEVEL cell: peak in dBFS, with a warning when the mic is very quiet */
+function updateMicLevel(appState: AppState) {
+  const el = containerElement?.querySelector('#mic-level-val');
+  if (!el) return;
+  if (!appState.isRecording) {
+    el.textContent = '--';
+    el.className = 'telemetry-value standby';
+    return;
+  }
+  const db = appState.micLevel > 0 ? 20 * Math.log10(appState.micLevel) : -99;
+  el.textContent = db < -30 ? `${db.toFixed(0)} dB LOW` : `${db.toFixed(0)} dB`;
+  el.className = db < -30 ? 'telemetry-value warning' : 'telemetry-value active';
 }
 
 function formatUptime(seconds: number): string {
@@ -176,6 +192,8 @@ const view: ViewModule = {
         </div>
       </div>
 
+      <button id="cancel-btn" class="commit-button" style="display: none; margin-bottom: 15px; border-color: var(--warning-red); color: var(--warning-red);">CANCEL RECORDING (NOTHING IS TYPED)</button>
+
       <div class="telemetry-grid">
         <div class="telemetry-cell">
           <div class="telemetry-label">DAEMON_UPTIME</div>
@@ -188,6 +206,10 @@ const view: ViewModule = {
         <div class="telemetry-cell">
           <div class="telemetry-label">VAD_STATE</div>
           <div class="telemetry-value standby" id="vad-val">STANDBY</div>
+        </div>
+        <div class="telemetry-cell">
+          <div class="telemetry-label">MIC_LEVEL (PEAK)</div>
+          <div class="telemetry-value standby" id="mic-level-val">--</div>
         </div>
         <div class="telemetry-cell">
           <div class="telemetry-label">ENGINE_RT</div>
@@ -203,6 +225,10 @@ const view: ViewModule = {
         </div>
       </div>
     `;
+
+    container.querySelector('#cancel-btn')?.addEventListener('click', () => {
+      _api.cancelRecording().catch(err => console.error('Cancel failed', err));
+    });
 
     const canvas = container.querySelector('#oscilloscope') as HTMLCanvasElement;
     if (canvas) {
@@ -235,6 +261,9 @@ const view: ViewModule = {
     if (charsVal) {
       charsVal.textContent = state.charsInjected.toLocaleString();
     }
+
+    const cancelBtn = containerElement.querySelector('#cancel-btn') as HTMLElement | null;
+    if (cancelBtn) cancelBtn.style.display = state.connected && state.isRecording ? 'block' : 'none';
 
     const vadVal = containerElement.querySelector('#vad-val');
     if (vadVal) {

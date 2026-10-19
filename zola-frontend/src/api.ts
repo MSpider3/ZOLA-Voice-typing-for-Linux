@@ -17,8 +17,17 @@ export interface HistoryEntry {
   duration_s: number;
 }
 
+export interface CatalogModel {
+  name: string;
+  label: string;
+  description: string;
+  size_mb: number;
+  installed: boolean;
+  download: { status: string; done: number; total: number } | null;
+}
+
 export interface SSEEvent {
-  type: 'state_change' | 'new_transcript';
+  type: 'state_change' | 'new_transcript' | 'level' | 'model_download';
   data: any;
 }
 
@@ -120,14 +129,59 @@ export class ZolaAPI {
     return data.models || [];
   }
 
-  /** GET /models/whisper */
-  async fetchWhisperModels(): Promise<string[]> {
+  /** GET /models/whisper — sizes plus installed model folders and their labels */
+  async fetchWhisperModels(): Promise<{ models: string[]; labels: Record<string, string> }> {
     const res = await this.fetchWithTimeout(`${API_BASE}/models/whisper`);
     if (!res.ok) {
       throw new Error(`HTTP error! status: ${res.status}`);
     }
     const data = await res.json();
-    return data.models || [];
+    return { models: data.models || [], labels: data.labels || {} };
+  }
+
+  /** GET /devices — microphone names */
+  async fetchDevices(): Promise<string[]> {
+    const res = await this.fetchWithTimeout(`${API_BASE}/devices`);
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+    const data = await res.json();
+    return data.devices || [];
+  }
+
+  /** GET /models/catalog — downloadable models and whether they are installed */
+  async fetchModelCatalog(): Promise<CatalogModel[]> {
+    const res = await this.fetchWithTimeout(`${API_BASE}/models/catalog`);
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+    return (await res.json()).models || [];
+  }
+
+  /** POST /models/download or /models/delete; progress arrives as 'model_download' events */
+  async manageModel(action: 'download' | 'delete', name: string): Promise<void> {
+    const res = await this.fetchWithTimeout(`${API_BASE}/models/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: `Model ${action} failed` }));
+      throw new Error(detail.detail || `Model ${action} failed: ${res.status}`);
+    }
+  }
+
+  /** POST /history/clear */
+  async clearHistory(): Promise<void> {
+    const res = await this.fetchWithTimeout(`${API_BASE}/history/clear`, { method: 'POST' });
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+  }
+
+  /** POST /cancel — stop recording without typing anything */
+  async cancelRecording(): Promise<void> {
+    await this.fetchWithTimeout(`${API_BASE}/cancel`, { method: 'POST' });
   }
 
   /** Starts the SSE listener connection */
@@ -175,6 +229,26 @@ export class ZolaAPI {
           this.sseCallback({ type: 'new_transcript', data: parsedData });
         } catch (err) {
           console.error('[Zola SSE] Failed to parse new_transcript data', err);
+        }
+      }
+    });
+
+    this.eventSource.addEventListener('level', (e: MessageEvent) => {
+      if (this.sseCallback) {
+        try {
+          this.sseCallback({ type: 'level', data: JSON.parse(e.data) });
+        } catch (err) {
+          console.error('[Zola SSE] Failed to parse level data', err);
+        }
+      }
+    });
+
+    this.eventSource.addEventListener('model_download', (e: MessageEvent) => {
+      if (this.sseCallback) {
+        try {
+          this.sseCallback({ type: 'model_download', data: JSON.parse(e.data) });
+        } catch (err) {
+          console.error('[Zola SSE] Failed to parse model_download data', err);
         }
       }
     });

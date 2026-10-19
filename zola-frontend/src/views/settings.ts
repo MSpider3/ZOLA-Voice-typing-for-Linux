@@ -1,8 +1,28 @@
 import { AppState, ViewModule } from '../main';
-import { ZolaAPI } from '../api';
+import { CatalogModel, ZolaAPI } from '../api';
 
 let containerElement: HTMLElement | null = null;
 let apiInstance: ZolaAPI | null = null;
+let downloadListener: ((e: Event) => void) | null = null;
+let lastCatalog: CatalogModel[] = [];
+
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// replacements setting <-> textarea lines of the form "wrong => right"
+function replacementsToText(map: Record<string, string> | undefined): string {
+  return Object.entries(map || {}).map(([k, v]) => `${k} => ${v}`).join('\n');
+}
+
+function textToReplacements(text: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const line of text.split('\n')) {
+    const [wrong, right] = line.split('=>').map(part => part?.trim());
+    if (wrong && right !== undefined) map[wrong] = right;
+  }
+  return map;
+}
 
 // ── Keybinding capture helper ─────────────────────────────────────────────────
 // Turns a raw KeyboardEvent into a canonical "ctrl+shift+r" style string.
@@ -41,6 +61,68 @@ function attachKeybindingCapture(input: HTMLInputElement) {
   });
 }
 
+// ── Model manager (Settings → MODELS) ────────────────────────────────────────
+function renderCatalog(models: CatalogModel[]) {
+  lastCatalog = models;
+  const box = containerElement?.querySelector('#model-catalog');
+  if (!box) return;
+  box.innerHTML = models.map(m => {
+    const dl = m.download;
+    const pct = dl && dl.total ? Math.floor((100 * dl.done) / dl.total) : 0;
+    const action = dl
+      ? `<span class="telemetry-value active" style="font-size: 13px;">DOWNLOADING ${pct}%</span>`
+      : m.installed
+        ? `<span class="telemetry-value" style="font-size: 13px;">INSTALLED</span>
+           <button type="button" class="commit-button model-action" data-action="delete" data-name="${escapeHtml(m.name)}"
+                   style="padding: 4px 10px; font-size: 11px; border-color: var(--warning-red); color: var(--warning-red);">DELETE</button>`
+        : `<button type="button" class="commit-button model-action" data-action="download" data-name="${escapeHtml(m.name)}"
+                   style="padding: 4px 10px; font-size: 11px;">DOWNLOAD (${m.size_mb} MB)</button>`;
+    return `
+      <div style="border: 1px solid var(--forest-green); padding: 12px; margin-bottom: 10px; background: rgba(0,0,0,0.3);">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+          <strong>${escapeHtml(m.label)}</strong>
+          <span style="display: flex; gap: 8px; align-items: center; white-space: nowrap;">${action}</span>
+        </div>
+        <div style="font-size: 12px; color: var(--subtle-green); margin-top: 6px;">${escapeHtml(m.description)}</div>
+        ${dl ? `<div style="height: 4px; background: var(--forest-green); margin-top: 8px;"><div style="height: 4px; width: ${pct}%; background: var(--phosphor-green);"></div></div>` : ''}
+        <div class="model-error" data-name="${escapeHtml(m.name)}" style="font-size: 12px; color: var(--warning-red); margin-top: 6px;"></div>
+      </div>`;
+  }).join('');
+
+  box.querySelectorAll('.model-action').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const { action, name } = (btn as HTMLElement).dataset as { action: 'download' | 'delete'; name: string };
+      if (action === 'delete' && !confirm(`Delete the ${name} model files?`)) return;
+      try {
+        await apiInstance?.manageModel(action, name);
+      } catch (err) {
+        const errEl = box.querySelector(`.model-error[data-name="${name}"]`);
+        if (errEl) errEl.textContent = err instanceof Error ? err.message : String(err);
+      }
+      refreshModels();
+    });
+  });
+}
+
+/** Reload the catalog and the model pickers, keeping the current selections */
+async function refreshModels() {
+  if (!containerElement || !apiInstance) return;
+  const [catalog, whisperInfo] = await Promise.all([
+    apiInstance.fetchModelCatalog().catch(() => [] as CatalogModel[]),
+    apiInstance.fetchWhisperModels().catch(() => null),
+  ]);
+  renderCatalog(catalog);
+  if (!whisperInfo) return;
+  for (const id of ['whisper_realtime', 'whisper_batch']) {
+    const select = containerElement.querySelector(`#${id}`) as HTMLSelectElement | null;
+    if (!select) continue;
+    const active = select.value;
+    select.innerHTML = whisperInfo.models.map(m =>
+      `<option value="${escapeHtml(m)}" ${active === m ? 'selected' : ''}>${escapeHtml(whisperInfo.labels[m] || m.toUpperCase())}</option>`
+    ).join('');
+  }
+}
+
 async function loadSettingsAndModels() {
   if (!containerElement || !apiInstance) return;
 
@@ -53,27 +135,31 @@ async function loadSettingsAndModels() {
     statusMsg.className = 'commit-status';
     statusMsg.textContent = 'QUERYING_CONFIG_REGISTRIES...';
 
-    const [currentConfig, ollamaModels, whisperModels] = await Promise.all([
+    const [currentConfig, ollamaModels, whisperInfo, devices] = await Promise.all([
       apiInstance.fetchSettings(),
       apiInstance.fetchOllamaModels().catch(() => []),
-      apiInstance.fetchWhisperModels().catch(() => ['tiny', 'base', 'small', 'medium', 'large-v2', 'large-v3'])
+      apiInstance.fetchWhisperModels().catch(() => ({
+        models: ['tiny', 'base', 'small', 'medium', 'large-v2', 'large-v3'], labels: {} as Record<string, string>,
+      })),
+      apiInstance.fetchDevices().catch(() => [] as string[]),
     ]);
 
-    // Whisper Realtime
+    // Whisper model selects: installed model folders show their label
+    const modelOptions = (active: string) => whisperInfo.models.map(m =>
+      `<option value="${escapeHtml(m)}" ${active === m ? 'selected' : ''}>${escapeHtml(whisperInfo.labels[m] || m.toUpperCase())}</option>`
+    ).join('');
     const rtSelect = form.querySelector('#whisper_realtime') as HTMLSelectElement;
-    if (rtSelect) {
-      const activeRt = currentConfig.whisper_realtime || 'base';
-      rtSelect.innerHTML = whisperModels.map(m =>
-        `<option value="${m}" ${activeRt === m ? 'selected' : ''}>${m.toUpperCase()}</option>`
-      ).join('');
-    }
-
-    // Whisper Batch
+    if (rtSelect) rtSelect.innerHTML = modelOptions(currentConfig.whisper_realtime || 'base');
     const batchSelect = form.querySelector('#whisper_batch') as HTMLSelectElement;
-    if (batchSelect) {
-      const activeBatch = currentConfig.whisper_batch || 'small';
-      batchSelect.innerHTML = whisperModels.map(m =>
-        `<option value="${m}" ${activeBatch === m ? 'selected' : ''}>${m.toUpperCase()}</option>`
+    if (batchSelect) batchSelect.innerHTML = modelOptions(currentConfig.whisper_batch || 'small');
+
+    // Microphone select ('' = system default)
+    const deviceSelect = form.querySelector('#input_device') as HTMLSelectElement;
+    if (deviceSelect) {
+      const active = currentConfig.input_device || '';
+      const names = active && !devices.includes(active) ? [active, ...devices] : devices;
+      deviceSelect.innerHTML = `<option value="">SYSTEM DEFAULT</option>` + names.map(d =>
+        `<option value="${escapeHtml(d)}" ${active === d ? 'selected' : ''}>${escapeHtml(d)}</option>`
       ).join('');
     }
 
@@ -110,10 +196,19 @@ async function loadSettingsAndModels() {
     setVal('batch_silence_timeout_s',      currentConfig.batch_silence_timeout_s,      3.0);
     setVal('batch_min_record_s',           currentConfig.batch_min_record_s,           0.5);
     setVal('history_max',                  currentConfig.history_max,                  50);
+    setVal('llm_api',                      currentConfig.llm_api,                      'ollama');
+    setVal('paste_method',                 currentConfig.paste_method,                 'ctrl_v');
+    setVal('restore_clipboard',            String(!!currentConfig.restore_clipboard));
+    setVal('audio_feedback',               String(currentConfig.audio_feedback !== false));
+    setVal('save_history',                 String(currentConfig.save_history !== false));
+    setVal('initial_prompt',               currentConfig.initial_prompt,               '');
+    setVal('replacements',                 replacementsToText(currentConfig.replacements));
 
     // Keybinding & Active Mode
     setVal('active_mode',                  currentConfig.active_mode,                  'batch');
     setVal('keybinding',                   currentConfig.keybinding,                   'ctrl+shift+v');
+
+    renderCatalog(await apiInstance.fetchModelCatalog().catch(() => [] as CatalogModel[]));
 
     statusMsg.className = 'commit-status success';
     statusMsg.textContent = 'REGISTRIES_LOADED_OK';
@@ -165,6 +260,14 @@ async function handleFormSubmit(e: SubmitEvent) {
     batch_silence_timeout_s:       getFlt('batch_silence_timeout_s'),
     batch_min_record_s:            getFlt('batch_min_record_s'),
     history_max:                   getInt('history_max'),
+    llm_api:                       getStr('llm_api'),
+    input_device:                  getStr('input_device') || null,
+    audio_feedback:                getStr('audio_feedback') === 'true',
+    paste_method:                  getStr('paste_method'),
+    restore_clipboard:             getStr('restore_clipboard') === 'true',
+    save_history:                  getStr('save_history') === 'true',
+    initial_prompt:                getStr('initial_prompt').trim() || null,
+    replacements:                  textToReplacements(getStr('replacements')),
     active_mode:                   getStr('active_mode'),
     keybinding:                    getStr('keybinding'),
   };
@@ -207,6 +310,14 @@ function applyDefaults(container: HTMLElement) {
   setVal('batch_silence_timeout_s',    '3.0');
   setVal('batch_min_record_s',         '0.5');
   setVal('history_max',                '50');
+  setVal('llm_api',                    'ollama');
+  setVal('input_device',               '');
+  setVal('audio_feedback',             'true');
+  setVal('paste_method',               'ctrl_v');
+  setVal('restore_clipboard',          'false');
+  setVal('save_history',               'true');
+  setVal('initial_prompt',             '');
+  setVal('replacements',               '');
   setVal('ollama_url',                 'http://127.0.0.1:11434');
   setVal('active_mode',                'batch');
   setVal('keybinding',                 'ctrl+shift+v');
@@ -272,10 +383,26 @@ const view: ViewModule = {
                 </div>
               </div>
               <div class="select-container">
-                <label class="select-label" for="ollama_url">OLLAMA_SERVER_URL (ollama_url)</label>
+                <label class="select-label" for="ollama_url">LLM_SERVER_URL (ollama_url, local only)</label>
                 <input type="text" id="ollama_url" class="crt-select" style="cursor: text;" />
               </div>
+              <div class="select-container">
+                <label class="select-label" for="llm_api">LLM_SERVER_API (llm_api)</label>
+                <div class="crt-select-wrap">
+                  <select id="llm_api" class="crt-select">
+                    <option value="ollama">OLLAMA</option>
+                    <option value="openai">OPENAI-COMPATIBLE (llama.cpp / LM Studio)</option>
+                  </select>
+                </div>
+              </div>
             </div>
+
+            <!-- ─────────────────── MODELS ────────────────────────────── -->
+            <div class="settings-section-title">SYSTEM_REGISTRY // MODELS</div>
+            <p style="font-size:11px; color: var(--subtle-green); margin: 0 0 12px; opacity: 0.8;">
+              Extra speech models, downloaded once and used offline. Standard Whisper sizes download automatically when selected below.
+            </p>
+            <div id="model-catalog" style="margin-bottom: 25px;">LOADING...</div>
 
             <!-- ─────────────────── WHISPER STT ───────────────────────── -->
             <div class="settings-section-title">SYSTEM_REGISTRY // WHISPER_STT</div>
@@ -344,6 +471,23 @@ const view: ViewModule = {
                   </select>
                 </div>
               </div>
+              <div class="select-container">
+                <label class="select-label" for="input_device">MICROPHONE (input_device)</label>
+                <div class="crt-select-wrap">
+                  <select id="input_device" class="crt-select">
+                    <option value="">SYSTEM DEFAULT</option>
+                  </select>
+                </div>
+              </div>
+              <div class="select-container">
+                <label class="select-label" for="audio_feedback">START/STOP_SOUND (audio_feedback)</label>
+                <div class="crt-select-wrap">
+                  <select id="audio_feedback" class="crt-select">
+                    <option value="true">ON</option>
+                    <option value="false">OFF</option>
+                  </select>
+                </div>
+              </div>
             </div>
 
             <!-- ─────────────────── REALTIME ──────────────────────────── -->
@@ -387,6 +531,38 @@ const view: ViewModule = {
                 <label class="select-label" for="typing_delay_ms">INTER_KEY_TYPING_DELAY (typing_delay_ms)</label>
                 <input type="number" id="typing_delay_ms" class="crt-select" min="1" max="200" step="1" style="cursor: text;" />
               </div>
+              <div class="select-container">
+                <label class="select-label" for="paste_method">PASTE_KEYS (paste_method)</label>
+                <div class="crt-select-wrap">
+                  <select id="paste_method" class="crt-select">
+                    <option value="ctrl_v">CTRL+V (MOST APPS)</option>
+                    <option value="ctrl_shift_v">CTRL+SHIFT+V (TERMINALS)</option>
+                    <option value="shift_insert">SHIFT+INSERT (APPS AND TERMINALS)</option>
+                  </select>
+                </div>
+              </div>
+              <div class="select-container">
+                <label class="select-label" for="restore_clipboard">RESTORE_CLIPBOARD_AFTER_PASTE (restore_clipboard)</label>
+                <div class="crt-select-wrap">
+                  <select id="restore_clipboard" class="crt-select">
+                    <option value="true">ON</option>
+                    <option value="false">OFF</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- ─────────────────── CORRECTIONS ───────────────────────── -->
+            <div class="settings-section-title">SYSTEM_REGISTRY // VOCABULARY_AND_CORRECTIONS</div>
+            <div class="matrix-grid" style="margin-bottom: 25px;">
+              <div class="select-container">
+                <label class="select-label" for="initial_prompt">VOCABULARY_HINT (initial_prompt) — names and terms you use</label>
+                <input type="text" id="initial_prompt" class="crt-select" style="cursor: text;" placeholder="e.g. ZOLA, STT, Hinglish, Bengaluru" />
+              </div>
+              <div class="select-container">
+                <label class="select-label" for="replacements">REPLACEMENTS (one per line: heard =&gt; wanted)</label>
+                <textarea id="replacements" class="crt-select" rows="4" style="cursor: text; resize: vertical;" placeholder="STD => STT"></textarea>
+              </div>
             </div>
 
             <!-- ─────────────────── DATA LEDGER ───────────────────────── -->
@@ -395,6 +571,15 @@ const view: ViewModule = {
               <div class="select-container">
                 <label class="select-label" for="history_max">MAX_HISTORY_ENTRIES (history_max)</label>
                 <input type="number" id="history_max" class="crt-select" min="5" max="1000" step="1" style="cursor: text;" />
+              </div>
+              <div class="select-container">
+                <label class="select-label" for="save_history">KEEP_HISTORY_AFTER_RESTART (save_history)</label>
+                <div class="crt-select-wrap">
+                  <select id="save_history" class="crt-select">
+                    <option value="true">ON</option>
+                    <option value="false">OFF</option>
+                  </select>
+                </div>
               </div>
             </div>
 
@@ -422,12 +607,37 @@ const view: ViewModule = {
       restoreBtn.addEventListener('click', () => applyDefaults(container));
     }
 
+    // Download progress / completion from the daemon (see main.ts)
+    downloadListener = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      const status = detail?.status;
+      if (status === 'downloading') {
+        renderCatalog(lastCatalog.map(m => m.name === detail.name
+          ? { ...m, download: { status, done: detail.done, total: detail.total } }
+          : m));
+      } else {
+        refreshModels();
+        if (status === 'error') {
+          const statusMsg = containerElement?.querySelector('#settings-status');
+          if (statusMsg) {
+            statusMsg.className = 'commit-status error';
+            statusMsg.textContent = `MODEL_DOWNLOAD_FAILED: ${detail?.error || ''}`;
+          }
+        }
+      }
+    };
+    window.addEventListener('zola-model-download', downloadListener);
+
     loadSettingsAndModels();
   },
 
   updateState(_state: AppState) {},
 
   destroy() {
+    if (downloadListener) {
+      window.removeEventListener('zola-model-download', downloadListener);
+      downloadListener = null;
+    }
     containerElement = null;
     apiInstance = null;
   }

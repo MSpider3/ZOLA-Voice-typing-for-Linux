@@ -65,7 +65,7 @@ async function loadAndRenderHistory() {
     // Sort newest first, cap at 100 rows to prevent DOM bloat
     const sortedHistory = [...history].reverse().slice(0, 100);
 
-    tableBody.innerHTML = sortedHistory.map((entry: HistoryEntry) => {
+    tableBody.innerHTML = sortedHistory.map((entry: HistoryEntry, index: number) => {
       const modeClass = entry.mode.startsWith('realtime') ? 'mode-rt' : 'mode-batch';
       const displayMode = entry.mode.toUpperCase().replace('_', '-');
       const durationText = entry.duration_s ? `${entry.duration_s.toFixed(2)}s` : 'N/A';
@@ -74,11 +74,26 @@ async function loadAndRenderHistory() {
         <tr>
           <td style="white-space: nowrap; font-size: 12px; color: var(--forest-green);">${formatTimestamp(entry.timestamp)}</td>
           <td style="white-space: nowrap; font-weight: 700;" class="${modeClass}">${displayMode}</td>
-          <td style="word-break: break-all;">${escapeHtml(entry.transcript)}</td>
-          <td style="white-space: nowrap; text-align: right; color: var(--forest-green);">${durationText}</td>
+          <td style="word-break: break-word;">${escapeHtml(entry.transcript)}</td>
+          <td style="white-space: nowrap; text-align: right; color: var(--forest-green);">${durationText}
+            <button class="copy-row-btn commit-button" data-index="${index}" style="padding: 2px 8px; margin-left: 8px; font-size: 11px;">COPY</button>
+          </td>
         </tr>
       `;
     }).join('');
+
+    tableBody.querySelectorAll('.copy-row-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const entry = sortedHistory[Number((btn as HTMLElement).dataset.index)];
+        try {
+          await navigator.clipboard.writeText(entry.transcript);
+          btn.textContent = 'COPIED';
+        } catch {
+          btn.textContent = 'FAILED';
+        }
+        setTimeout(() => { btn.textContent = 'COPY'; }, 1200);
+      });
+    });
 
   } catch (err) {
     console.error('Failed to load history', err);
@@ -99,7 +114,10 @@ const view: ViewModule = {
 
     container.innerHTML = `
       <div class="ledger-container">
-        <div class="pane-title" style="margin: 20px 20px 0 20px;">SYSTEM_LOG // TRANSCRIPTION_LEDGER</div>
+        <div class="pane-title" style="margin: 20px 20px 0 20px; display: flex; justify-content: space-between; align-items: center;">
+          <span>SYSTEM_LOG // TRANSCRIPTION_LEDGER</span>
+          <button id="clear-history-btn" class="commit-button" style="padding: 4px 12px; font-size: 11px; border-color: var(--warning-red); color: var(--warning-red);">CLEAR HISTORY</button>
+        </div>
         <div class="ledger-table-wrap scrollable-container">
           <table class="ledger-table">
             <thead>
@@ -117,6 +135,16 @@ const view: ViewModule = {
         </div>
       </div>
     `;
+
+    container.querySelector('#clear-history-btn')?.addEventListener('click', async () => {
+      if (!confirm('Delete all transcription history? This cannot be undone.')) return;
+      try {
+        await api.clearHistory();
+      } catch (err) {
+        console.error('Failed to clear history', err);
+      }
+      loadAndRenderHistory();
+    });
 
     loadAndRenderHistory();
   },

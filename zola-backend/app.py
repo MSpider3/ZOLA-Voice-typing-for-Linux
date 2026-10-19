@@ -35,12 +35,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from config import Config, load_config, update_config
+from config import MODELS_DIR, Config, installed_models, load_config, update_config
 from core_llm import OllamaClient
-from core_stt import WhisperEngine
+import model_store
+from core_stt import WhisperEngine, _model_meta, apply_replacements
 from injector import KeystrokeInjector
-from recorder import AudioRecorder
-from state import AppState, RecordingMode
+from recorder import AudioRecorder, list_input_devices, play_cue
+from state import HISTORY_PATH, AppState, RecordingMode
 
 # --------------------------------------------------------------------------- #
 # Logging Setup
@@ -59,6 +60,7 @@ WHISPER_MODEL_SIZES = [
     "tiny", "base", "small", "medium",
     "large-v2", "large-v3",
     "large-v3-turbo",
+    "tiny.en", "base.en", "small.en",
 ]
 
 # Whisper models that were not trained on the translate task
@@ -120,7 +122,11 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_event_loop()
     loop.set_default_executor(executor)
 
-    app.state.app_state = AppState(history_max=cfg.history_max)
+    app.state.downloads = {}  # model name -> {"status", "done", "total"}
+    app.state.app_state = AppState(
+        history_max=cfg.history_max,
+        history_path=HISTORY_PATH if cfg.save_history else None,
+    )
 
     try:
         recorder = AudioRecorder(
@@ -167,10 +173,13 @@ async def lifespan(app: FastAPI):
     logger.info("Zola daemon ready — listening on http://127.0.0.1:5001")
     logger.info("=" * 60)
 
+    level_task = asyncio.create_task(_level_broadcaster(app), name="mic-level")
+
     try:
         yield
     finally:
         logger.info("Zola daemon shutting down…")
+        level_task.cancel()
 
         if hasattr(app.state, "app_state"):
             try:
@@ -298,8 +307,12 @@ def _check_rate_limit() -> None:
 
 async def _open_mic(request: Request, audio_path: Path) -> None:
     """Start the recorder; if the mic cannot be opened, undo the recording state."""
+    cfg = _cfg(request)
+    if cfg.audio_feedback:
+        # Played before the mic opens, so the tone is not recorded
+        await asyncio.get_event_loop().run_in_executor(None, play_cue, "start")
     try:
-        request.app.state.recorder.start(audio_path)
+        request.app.state.recorder.start(audio_path, cfg.input_device)
     except Exception as exc:
         await _state(request).stop_recording()
         audio_path.unlink(missing_ok=True)
@@ -321,6 +334,21 @@ def broadcast_event(event_type: str, data: dict) -> None:
             q.put_nowait({"type": event_type, "data": data})
         except Exception as exc:
             logger.error("Failed to push event to SSE client queue: %s", exc)
+
+
+async def _level_broadcaster(app: FastAPI) -> None:
+    """Send the mic peak level 10x per second while recording (UI level meter)."""
+    while True:
+        await asyncio.sleep(0.1)
+        recorder = getattr(app.state, "recorder", None)
+        if _sse_clients and recorder is not None and recorder._is_recording:
+            broadcast_event("level", {"level": round(recorder.level, 4)})
+
+
+def _stop_cue(cfg: Config) -> None:
+    """Play the stop tone in the background (never delays transcription)."""
+    if cfg.audio_feedback:
+        asyncio.get_event_loop().run_in_executor(None, play_cue, "stop")
 
 
 # --------------------------------------------------------------------------- #
@@ -511,6 +539,26 @@ async def get_status(request: Request) -> JSONResponse:
     return JSONResponse(status)
 
 
+@app.post("/cancel", summary="Stop recording and discard it (nothing is typed)")
+async def cancel_recording(request: Request) -> JSONResponse:
+    app_state = _state(request)
+    if not app_state.is_recording:
+        return JSONResponse({"status": "idle"})
+    await app_state.cancel_realtime_task()
+    return JSONResponse({"status": "cancelled"})
+
+
+@app.get("/devices", summary="List microphones")
+async def get_devices() -> JSONResponse:
+    return JSONResponse({"devices": list_input_devices()})
+
+
+@app.post("/history/clear", summary="Delete all transcription history")
+async def clear_history(request: Request) -> JSONResponse:
+    await _state(request).clear_history()
+    return JSONResponse({"status": "ok"})
+
+
 @app.get("/history", summary="Recent transcription history")
 async def get_history(request: Request, limit: int = 20) -> JSONResponse:
     if not (1 <= limit <= 200):
@@ -599,6 +647,13 @@ async def post_settings(request: Request) -> JSONResponse:
         request.app.state.llm.set_base_url(cfg.ollama_url)
         reloaded.append("ollama_url")
 
+    if "llm_api" in changed_keys:
+        request.app.state.llm.api = cfg.llm_api
+        reloaded.append("llm_api")
+
+    if "save_history" in changed_keys:
+        _state(request).set_history_path(HISTORY_PATH if cfg.save_history else None)
+
     if "output_language" in changed_keys:
         request.app.state.llm.output_language = cfg.output_language
         reloaded.append("output_language")
@@ -625,9 +680,97 @@ async def get_ollama_models(request: Request) -> JSONResponse:
     return JSONResponse({"models": models})
 
 
+@app.get("/models/catalog", summary="Downloadable STT models and their install state")
+async def get_model_catalog(request: Request) -> JSONResponse:
+    downloads = request.app.state.downloads
+    return JSONResponse({"models": [
+        {
+            "name": name,
+            "label": entry["label"],
+            "description": entry["description"],
+            "size_mb": entry["size_mb"],
+            "installed": model_store.is_installed(name),
+            "download": downloads.get(name),
+        }
+        for name, entry in model_store.CATALOG.items()
+    ]})
+
+
+def _download_event(app: FastAPI, name: str, status: str, done: int = 0, total: int = 0,
+                    error: str = "") -> None:
+    """Record download progress and push it to the UI (event loop thread only)."""
+    if status == "downloading":
+        app.state.downloads[name] = {"status": status, "done": done, "total": total}
+    else:
+        app.state.downloads.pop(name, None)
+    broadcast_event("model_download", {"name": name, "status": status, "done": done,
+                                       "total": total, "error": error})
+
+
+@app.post("/models/download", summary="Download and install a catalog model", status_code=202)
+async def download_model(request: Request) -> JSONResponse:
+    try:
+        name = (await request.json()).get("name")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if name not in model_store.CATALOG:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{name}'")
+    if model_store.is_installed(name):
+        raise HTTPException(status_code=409, detail=f"'{name}' is already installed")
+    if name in request.app.state.downloads:
+        raise HTTPException(status_code=409, detail=f"'{name}' is already downloading")
+
+    app_ = request.app
+    loop = asyncio.get_running_loop()
+    last_sent = [0.0]
+
+    def progress(done: int, total: int) -> None:  # called from the download thread
+        now = time.monotonic()
+        if now - last_sent[0] >= 0.3 or done >= total:
+            last_sent[0] = now
+            loop.call_soon_threadsafe(_download_event, app_, name, "downloading", done, total)
+
+    async def run() -> None:
+        try:
+            await loop.run_in_executor(None, model_store.download, name, progress)
+            _model_meta.cache_clear()
+            _download_event(app_, name, "done")
+        except Exception as exc:
+            logger.exception("Model download '%s' failed: %s", name, exc)
+            _download_event(app_, name, "error", error=str(exc))
+
+    _download_event(app_, name, "downloading")
+    asyncio.create_task(run(), name=f"download-{name}")
+    return JSONResponse({"status": "started", "name": name}, status_code=202)
+
+
+@app.post("/models/delete", summary="Delete an installed catalog model")
+async def delete_model(request: Request) -> JSONResponse:
+    try:
+        name = (await request.json()).get("name")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if name not in model_store.CATALOG or not model_store.is_installed(name):
+        raise HTTPException(status_code=404, detail=f"'{name}' is not installed")
+    cfg = _cfg(request)
+    if name in (cfg.whisper_realtime, cfg.whisper_batch):
+        raise HTTPException(status_code=409, detail=f"'{name}' is in use — pick another model first")
+    model_store.delete(name)
+    _model_meta.cache_clear()
+    return JSONResponse({"status": "deleted", "name": name})
+
+
 @app.get("/models/whisper", summary="List valid faster-whisper model sizes")
 async def get_whisper_models() -> JSONResponse:
-    return JSONResponse({"models": WHISPER_MODEL_SIZES})
+    """Standard sizes plus installed model folders; `labels` describes the folders."""
+    custom = installed_models()
+    labels = {}
+    for name in custom:
+        try:
+            labels[name] = json.loads((MODELS_DIR / name / "zola.json").read_text(encoding="utf-8")).get("label", name)
+        except (OSError, ValueError):
+            labels[name] = name
+    return JSONResponse({"models": custom + WHISPER_MODEL_SIZES, "labels": labels})
 
 
 # --------------------------------------------------------------------------- #
@@ -668,6 +811,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
         )
 
         audio_path, duration_s = recorder.stop()
+        _stop_cue(cfg)
         await app_state.stop_recording()
         stopped = True
         broadcast_event("state_change", app_state.get_status())
@@ -694,6 +838,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
                 len(raw_transcript), time.monotonic() - t_start,
             )
 
+        raw_transcript = apply_replacements(raw_transcript, cfg.replacements)
         final_transcript = raw_transcript
         if mode == RecordingMode.BATCH_LLM and raw_transcript:
             final_transcript = await llm.format_transcript(raw_transcript)
@@ -701,7 +846,9 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
         if final_transcript:
             # Clipboard paste (Unicode-safe, works for Devanagari). The text
             # stays in the clipboard afterwards for manual paste if needed.
-            await injector.inject_text(final_transcript, cfg.typing_delay_ms)
+            await injector.inject_text(
+                final_transcript, cfg.typing_delay_ms, cfg.paste_method, cfg.restore_clipboard,
+            )
 
             await app_state.add_history(mode, final_transcript, duration_s)
             broadcast_event("new_transcript", {
@@ -760,6 +907,7 @@ async def _realtime_loop(request: Request) -> None:
     loop = asyncio.get_event_loop()
 
     mode = app_state.active_mode or RecordingMode.REALTIME
+    cancelled = False  # /cancel or shutdown: skip the final LLM refinement
     session_start = time.monotonic()
     session_transcript: list[str] = []
     prev_utterance: str = ""
@@ -782,13 +930,15 @@ async def _realtime_loop(request: Request) -> None:
                 None, stt.transcribe_chunk, utterance_audio, cfg.sample_rate, prev_utterance,
             )
 
-            text = text.strip() if text else ""
+            text = apply_replacements(text.strip(), cfg.replacements) if text else ""
             if not text:
                 continue
 
             # Inject via clipboard paste (Unicode-safe — handles Devanagari)
             prefix = " " if session_transcript else ""
-            await injector.inject_text(prefix + text, cfg.typing_delay_ms)
+            await injector.inject_text(
+                prefix + text, cfg.typing_delay_ms, cfg.paste_method, cfg.restore_clipboard,
+            )
 
             session_transcript.append(text)
             prev_utterance = text
@@ -804,11 +954,13 @@ async def _realtime_loop(request: Request) -> None:
 
     except asyncio.CancelledError:
         logger.info("Realtime loop cancelled")
+        cancelled = True
     except Exception as exc:
         logger.exception("Realtime loop error: %s", exc)
     finally:
         audio_path_str = app_state.current_audio_path
         recorder.stop()
+        _stop_cue(cfg)
 
         try:
             await app_state.stop_recording()
@@ -820,7 +972,7 @@ async def _realtime_loop(request: Request) -> None:
         full_text = " ".join(session_transcript)
 
         if full_text:
-            if mode == RecordingMode.REALTIME_LLM:
+            if mode == RecordingMode.REALTIME_LLM and not cancelled:
                 logger.info("Realtime LLM: refining %d chars via local LLM", len(full_text))
                 refined_text = await llm.format_transcript(full_text)
                 asyncio.create_task(injector.copy_to_clipboard(refined_text))

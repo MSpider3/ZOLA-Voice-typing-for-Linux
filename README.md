@@ -91,7 +91,10 @@ The Tauri frontend communicates with the backend via two channels:
   2. **Batch + LLM Refinement:** Transcribes audio, passes the text to a local Ollama model for grammar correction and formatting, copies to clipboard, and types it.
   3. **Realtime STT:** Streams audio and types words continuously as you speak.
   4. **Realtime + LLM Refinement:** Streams live transcription and performs final formatting cleanup when speaking stops.
-- **CRT Phosphor Visualizer:** Simulated green-glow analog oscilloscope that reflects the idle / recording / offline state.
+- **CRT Phosphor Visualizer:** Green-glow analog oscilloscope driven by the live microphone level, with a dBFS readout that warns when the mic is too quiet.
+- **Output options:** paste with Ctrl+V, Ctrl+Shift+V (terminals) or Shift+Insert; optionally restore your previous clipboard after pasting; start/stop sound cues; microphone selection.
+- **Corrections:** a vocabulary hint (names and terms you use) and whole-word replacements (`STD => STT`) applied to every transcript.
+- **History:** kept across restarts in `~/.local/share/zola/history.json` (can be turned off), with copy and clear buttons. `POST /cancel` discards a recording without typing anything.
 - **Automatic Legacy Migration:** Automatically migrates configurations from `~/.config/speaktype/` to `~/.config/zola/` on boot without crashing.
 - **Hardened Error Fail-safes:** Employs a custom `release_all()` routine ensuring that if the daemon crashes mid-injection, modifier keys (like Shift or Ctrl) do not remain stuck.
 
@@ -117,14 +120,30 @@ curl -fsSL https://raw.githubusercontent.com/MSpider3/ZOLA-Voice-typing-for-Linu
 | `spoken_language` | Sets language dictation mode: `en` (English), `hi` (Hindi), `mixed` (Hinglish), or `auto`. |
 | `whisper_batch` | Model used for batch transcription (default: `small`). |
 | `whisper_realtime` | Model used for realtime streaming (default: `base`). |
+| `paste_method` | `ctrl_v` (default), `ctrl_shift_v` (terminals) or `shift_insert` (apps and terminals). |
+| `restore_clipboard` | Put your previous clipboard text back after pasting (default: off). |
+| `audio_feedback` | Short tones when recording starts and stops (default: on). |
+| `input_device` | Microphone name from `GET /devices`; `null` = system default. |
+| `replacements` | Whole-word fixes, e.g. `{"STD": "STT"}`. |
+| `save_history` | Keep history across restarts (default: on). |
+| `llm_api` | `ollama` (default) or `openai` for an OpenAI-compatible local server (llama.cpp server, LM Studio) at `ollama_url`. |
 
 ## Models
 
-Zola relies on local CTranslate2 `faster-whisper` models:
-- **`tiny` / `base`**: Excellent for low-spec laptops or realtime feedback.
-- **`small`**: The recommended default for balanced performance and high accuracy.
-- **`large-v3-turbo`**: Highly accurate but computationally heavy; may cause thermal throttling on compact laptops.
-- **`nemotron`**: Evaluated for monolingual Hindi/English; deferred to v1.3.0 for a dedicated modular engine due to high code-switching error rates and PyTorch overhead.
+Zola runs local CTranslate2 `faster-whisper` models, plus extra model folders in `~/.local/share/zola/models/`. Measured on a 2-core Intel i3-1005G1 (word error rate; Hindi and Hinglish scored after romanizing so the output script does not count; RTF = processing time ÷ audio length):
+
+| Model | English | Hindi | Hinglish | Your-voice Hindi / Hinglish | RTF | RAM | Output |
+|---|---|---|---|---|---|---|---|
+| **`hinglish-swift`** (Oriserve Hindi2Hinglish-Swift, int8, 78 MB) | 18% | **10%** | **12%** | 18% / 17% | **0.15** | 0.9 GB | Romanized Hinglish |
+| **`nemotron-3.5`** (NVIDIA, sherpa-onnx int8) | **8%** | 17% | 36% | 13% / 45% | 0.46 | 1.0 GB | Devanagari + English |
+| `base.en` / `small.en` | 11% / 12% | – | – | – | 0.12 / 0.31 | 0.9 / 1.5 GB | English only |
+| `small` (old default) | 16% | 44% | 51% | 100% / 101% | 1.46 | 2.3 GB | Devanagari |
+
+- **Download from the app:** Settings → MODELS → DOWNLOAD, then pick the model for batch and realtime separately. Downloads come from fixed sources (`hinglish-swift` from [MSpider3/whisper-hindi2hinglish-swift-ct2](https://huggingface.co/MSpider3/whisper-hindi2hinglish-swift-ct2), `nemotron-3.5` from the sherpa-onnx release) and the models then run offline. Headless: `curl -X POST http://127.0.0.1:5001/models/download -H 'Content-Type: application/json' -d '{"name":"hinglish-swift"}'`.
+- **Hindi / Hinglish speakers:** `hinglish-swift` for both batch and realtime (~10x faster than `small` and far more accurate). It writes Roman script, like most people type Hinglish.
+- **Devanagari Hindi or best English:** `nemotron-3.5` with `spoken_language` set to `hi` or `en`.
+- **English only:** `base.en` (fastest) or `small.en`.
+- Installed models appear in Settings without restarting the daemon. Full evaluation: [STT_EVALUATION.md](STT_EVALUATION.md).
 
 ## Requirements
 
@@ -136,7 +155,8 @@ Zola relies on local CTranslate2 `faster-whisper` models:
 ## Known Limitations
 
 - **Ollama Translators**: The local HTTP endpoint `/trigger/batch-translate` is currently marked experimental. Native Whisper translation to English is heavily unreliable for Hinglish input.
-- **Code-Switching Support**: CTranslate2 `faster-whisper` remains the primary engine; multilingual models require the curated Hinglish priming prompt for optimal code-switching accuracy.
+- **Code-Switching Support**: `hinglish-swift` handles Hinglish in Roman script; no model tested writes mixed script (Hindi in Devanagari, English in Latin) reliably on a weak CPU.
+- **LLM refinement on weak CPUs**: small models (1–2B) sometimes answer a dictated question or change the meaning; Zola discards such outputs, but refinement is slow (10–70 s on a 2-core CPU) and best left off there.
 
 ---
 

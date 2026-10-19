@@ -22,19 +22,24 @@ Hinglish priming:
 """
 
 import asyncio
+import functools
 import gc
+import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Union
+
+from types import SimpleNamespace
 
 import numpy as np
 from scipy.io import wavfile
 from faster_whisper import WhisperModel
 from faster_whisper.vad import VadOptions
 
-from config import Config
+from config import MODELS_DIR, VALID_WHISPER_SIZES, Config
 
 logger = logging.getLogger(__name__)
 _ZOLA_DEBUG = os.environ.get("ZOLA_DEBUG") == "1"
@@ -51,6 +56,11 @@ HINGLISH_PROMPT = (
 # hallucinating.  Smaller models (tiny, base, small) produce >100% WER
 # when prompted with mixed-script text.
 _HINGLISH_SAFE_MODELS = {"large-v3-turbo", "large-v3", "large-v2", "medium"}
+
+# Greedy decoding only. Whisper's default temperature fallback (0.2 … 1.0)
+# re-decodes hard audio up to five more times; on a weak CPU that turned 35 s
+# of Hindi into 70-150 s of processing and produced random-script garbage.
+_TEMPERATURE = 0.0
 
 _VAD_PARAMS = VadOptions(
     min_silence_duration_ms=300,  # tighter — less clipping
@@ -110,6 +120,14 @@ class WhisperEngine:
             cpu_threads=self._config.cpu_threads,
             num_workers=2,   # Up from 1: preprocessing overlaps with inference
         )
+
+        local_dir = MODELS_DIR / size
+        if _model_meta(size).get("engine") == "sherpa-transducer":
+            logger.info("WhisperEngine: loading sherpa-onnx model '%s' from %s", size, local_dir)
+            return _SherpaTransducer(local_dir, self._config.cpu_threads)
+        if (local_dir / "model.bin").is_file():
+            logger.info("WhisperEngine: loading '%s' from %s", size, local_dir)
+            return WhisperModel(str(local_dir), **_common_kwargs)
 
         try:
             model = WhisperModel(size, local_files_only=True, **_common_kwargs)
@@ -183,10 +201,14 @@ class WhisperEngine:
         # Hinglish priming — biases Whisper toward Hindi/English code-switching.
         # Only applied when: batch mode + mixed/auto language + model is large enough.
         # Small models hallucinate catastrophically with this prompt (WER >100%).
-        if mode == "batch" and self._config.spoken_language in ("auto", "mixed"):
+        # Fine-tuned models with a pinned language need no priming.
+        global _priming_warned
+        if (mode == "batch" and self._config.spoken_language in ("auto", "mixed")
+                and not _pinned_language(self._config.whisper_batch)):
             if self._config.whisper_batch in _HINGLISH_SAFE_MODELS:
                 parts.append(HINGLISH_PROMPT)
-            else:
+            elif not _priming_warned:
+                _priming_warned = True
                 logger.warning(
                     "WhisperEngine: Hinglish priming prompt suppressed — "
                     "model '%s' hallucinates with this prompt. "
@@ -202,18 +224,35 @@ class WhisperEngine:
         combined = " ".join(parts).strip()
         return combined if combined else None
 
-    def _resolve_language(self, model: WhisperModel, audio: np.ndarray) -> str:
+    def _resolve_language(self, model: WhisperModel, audio: np.ndarray, slot: str) -> str:
         """
         Resolve the Whisper language for this audio.
+        A language pinned in the model's zola.json always wins (fine-tunes
+        such as Oriserve Hindi2Hinglish need the 'en' token for any speech).
         spoken_language 'en'/'hi' (or the legacy language field) is used as-is.
         For 'auto'/'mixed' the choice is restricted to Hindi or English, so short
         Hinglish utterances are never transcribed as Urdu/Bengali/Punjabi.
         """
+        name = self._names[slot]
+        pinned = _pinned_language(name)
+        if pinned:
+            return pinned
+        if name.endswith(".en"):
+            return "en"
         spoken = self._config.spoken_language
+        if isinstance(model, _SherpaTransducer):
+            # Nemotron picks the language itself with "auto"; Hinglish is best
+            # decoded as Hindi (English words come out in Devanagari).
+            return spoken if spoken in ("en", "hi") else ("hi" if spoken == "mixed" else "auto")
         if spoken in ("en", "hi"):
             return spoken
         if self._config.language not in (None, "auto"):
             return self._config.language
+        # Detection costs a full encoder pass. When the realtime model is a
+        # (smaller) standard multilingual Whisper, detect with it instead.
+        rt_name = self._names["realtime"]
+        if rt_name in VALID_WHISPER_SIZES and not rt_name.endswith(".en") and self._realtime is not None:
+            model = self._realtime
         _, _, all_probs = model.detect_language(
             audio, vad_filter=True, vad_parameters=_VAD_PARAMS,
         )
@@ -254,10 +293,11 @@ class WhisperEngine:
             # so no word is split at an arbitrary chunk boundary.
             segments, info = model.transcribe(
                 audio,
-                language=self._resolve_language(model, audio),
+                language=self._resolve_language(model, audio, "realtime" if mode == "realtime" else "batch"),
                 task="transcribe",
                 beam_size=5,
                 best_of=5,
+                temperature=_TEMPERATURE,
                 vad_filter=True,
                 vad_parameters=_VAD_PARAMS,
                 no_speech_threshold=0.5,
@@ -305,10 +345,11 @@ class WhisperEngine:
         try:
             segments, info = model.transcribe(
                 audio,
-                language=self._resolve_language(model, audio),
+                language=self._resolve_language(model, audio, "realtime"),
                 task="transcribe",
                 beam_size=1,
                 best_of=1,
+                temperature=_TEMPERATURE,
                 vad_filter=True,
                 vad_parameters=_VAD_PARAMS,
                 no_speech_threshold=0.5,
@@ -352,10 +393,11 @@ class WhisperEngine:
 
             segments, info = model.transcribe(
                 audio,
-                language=self._resolve_language(model, audio),
+                language=self._resolve_language(model, audio, "batch"),
                 task="translate",          # ← Whisper translates to English
                 beam_size=5,
                 best_of=5,
+                temperature=_TEMPERATURE,
                 vad_filter=True,
                 vad_parameters=_VAD_PARAMS,
                 initial_prompt=self._build_initial_prompt(mode="translate"),
@@ -381,11 +423,79 @@ class WhisperEngine:
 # --------------------------------------------------------------------------- #
 # Private Helpers
 # --------------------------------------------------------------------------- #
+_priming_warned = False
+
+# A phrase of 1-4 words repeated 4+ times in a row: Whisper's decoding loop
+_REPEAT_RE = re.compile(r"(?<!\S)(\S+(?:\s+\S+){0,3}?)(?:\s+\1(?!\S)){3,}")
+
+
+@functools.lru_cache(maxsize=None)
+def _model_meta(model_name: str | None) -> dict:
+    """Contents of MODELS_DIR/<name>/zola.json ({} if absent)."""
+    if not model_name:
+        return {}
+    try:
+        return json.loads((MODELS_DIR / model_name / "zola.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _pinned_language(model_name: str | None) -> str | None:
+    """Language token pinned by MODELS_DIR/<name>/zola.json, if any."""
+    return _model_meta(model_name).get("language")
+
+
+class _SherpaTransducer:
+    """
+    A sherpa-onnx streaming transducer (NVIDIA Nemotron 3.5 ASR) with the
+    small part of faster-whisper's WhisperModel interface that WhisperEngine
+    uses, so the rest of the pipeline is unchanged. Whisper-only options
+    (beam size, prompts, VAD filter, translate) are ignored.
+    """
+
+    def __init__(self, model_dir: Path, threads: int) -> None:
+        import sherpa_onnx  # optional dependency, only needed for these models
+
+        def pick(pattern: str) -> str:
+            return str(sorted(model_dir.glob(pattern))[0])
+
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            encoder=pick("encoder*.onnx"), decoder=pick("decoder*.onnx"),
+            joiner=pick("joiner*.onnx"), tokens=str(model_dir / "tokens.txt"),
+            num_threads=threads,
+        )
+
+    def transcribe(self, audio, language: str | None = None, **_whisper_options):
+        if not isinstance(audio, np.ndarray):
+            _, data = wavfile.read(str(audio))
+            audio = data.astype(np.float32) / 32768.0
+        stream = self._recognizer.create_stream()
+        stream.set_option("language", language or "auto")
+        stream.accept_waveform(16000, audio)
+        stream.accept_waveform(16000, np.zeros(8000, dtype=np.float32))  # flush the last chunk
+        stream.input_finished()
+        while self._recognizer.is_ready(stream):
+            self._recognizer.decode_stream(stream)
+        text = self._recognizer.get_result(stream).strip()
+        return [SimpleNamespace(text=text)], SimpleNamespace(language=language)
+
+
+def apply_replacements(text: str, replacements: dict[str, str]) -> str:
+    """Whole-word, case-insensitive find/replace (the 'replacements' setting)."""
+    for wrong, right in replacements.items():
+        if wrong.strip():
+            text = re.sub(
+                rf"(?<![\w\u0900-\u097F]){re.escape(wrong.strip())}(?![\w\u0900-\u097F])",
+                lambda _m: right, text, flags=re.IGNORECASE,
+            )
+    return text
+
+
 def _join_segments(segments) -> str:
-    """Materialise the lazy segment generator and join all text."""
+    """Materialise the lazy segment generator, join the text, cut repetition loops."""
     texts = []
     for seg in segments:
         text = seg.text.strip()
         if text:
             texts.append(text)
-    return " ".join(texts)
+    return _REPEAT_RE.sub(r"\1 \1", " ".join(texts))

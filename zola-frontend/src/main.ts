@@ -8,6 +8,7 @@ export interface AppState {
   uptimeS: number;
   charsInjected: number;
   connected: boolean;
+  micLevel: number; // peak 0..1 of the latest mic block, while recording
   // Configuration snapshots
   ollamaModel: string;
   whisperRealtime: string;
@@ -22,7 +23,8 @@ export const state: AppState = {
   uptimeS: 0,
   charsInjected: 0,
   connected: false,
-  ollamaModel: 'thirdeyeai/qwen2.5-1.5b-instruct-uncensored:Q4_0',
+  micLevel: 0,
+  ollamaModel: '',
   whisperRealtime: 'base',
   whisperBatch: 'small'
 };
@@ -127,6 +129,7 @@ function handleSSEEvent(event: any) {
     state.ollamaModel = statusData.ollama_model;
     state.whisperRealtime = statusData.whisper_realtime;
     state.whisperBatch = statusData.whisper_batch;
+    if (!state.isRecording) state.micLevel = 0;
 
     updateConnectionUI(state.connected ? 'ONLINE' : 'OFFLINE');
 
@@ -134,6 +137,12 @@ function handleSSEEvent(event: any) {
     if (currentView && typeof currentView.updateState === 'function') {
       currentView.updateState(state);
     }
+  } else if (event.type === 'model_download') {
+    // The settings view shows download progress
+    window.dispatchEvent(new CustomEvent('zola-model-download', { detail: event.data }));
+  } else if (event.type === 'level') {
+    // Read by the dashboard animation; no view update needed
+    state.micLevel = event.data.level;
   } else if (event.type === 'new_transcript') {
     const transcriptData = event.data;
     if (transcriptData.session_transcript) {
@@ -202,6 +211,21 @@ async function bootstrap() {
           let w_real = 'base', w_batch = 'small';
           if (hw === 'light') { w_real = 'tiny'; w_batch = 'base'; }
           else if (hw === 'accurate') { w_real = 'small'; w_batch = 'large-v3-turbo'; }
+
+          // Benchmarked on a 2-core i3 (STT_EVALUATION.md): English-only models are
+          // faster and more accurate for English; the Hinglish fine-tune is
+          // ~10x faster than 'small' and far more accurate for Hindi/Hinglish,
+          // but it writes Roman script, so not for strict-Devanagari Hindi.
+          if (lang === 'en') {
+            w_real = 'base.en';
+            w_batch = hw === 'light' ? 'base.en' : 'small.en';
+          } else if (lang !== 'hi') {
+            const installed = await api.fetchWhisperModels().catch(() => ({ models: [] as string[] }));
+            if (installed.models.includes('hinglish-swift')) {
+              w_real = 'hinglish-swift';
+              w_batch = 'hinglish-swift';
+            }
+          }
           
           const submitBtn = form.querySelector('button');
           if (submitBtn) submitBtn.textContent = 'SAVING...';

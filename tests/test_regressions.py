@@ -80,7 +80,7 @@ class _Recorder:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
 
-    def start(self, audio_path) -> None:
+    def start(self, audio_path, device=None) -> None:
         if self.fail:
             raise RuntimeError("no mic")
 
@@ -103,6 +103,7 @@ class ApiTests(_TempConfig):
     def setUp(self) -> None:
         super().setUp()
         zapp.app.state.config = config.load_config()
+        zapp.app.state.config.audio_feedback = False  # no tones from the test run
         zapp.app.state.app_state = zapp.AppState()
         zapp.app.state.recorder = _Recorder()
         zapp.app.state.llm = _LLM()
@@ -154,10 +155,138 @@ class ApiTests(_TempConfig):
         r = self.client.get("/status", headers={"Host": "evil.example:5001"})
         self.assertEqual(r.status_code, 400)
 
+    def test_cancel_discards_recording(self) -> None:
+        self.assertEqual(self.client.post("/cancel").json(), {"status": "idle"})
+
+        # TestClient runs each request on its own loop, so drive the handler directly
+        async def scenario():
+            st = zapp.AppState()
+            await st.start_recording(zapp.RecordingMode.BATCH)
+            task = asyncio.create_task(asyncio.sleep(3600))
+            await st.set_realtime_task(task)
+            zapp.app.state.app_state = st
+
+            class _Req:
+                app = zapp.app
+            response = await zapp.cancel_recording(_Req())
+            await asyncio.sleep(0)
+            return response.body, task.cancelled()
+
+        body, was_cancelled = asyncio.run(scenario())
+        self.assertEqual(body, b'{"status":"cancelled"}')
+        self.assertTrue(was_cancelled)
+
+    def test_invalid_new_settings_rejected(self) -> None:
+        for bad in ({"paste_method": "alt_v"}, {"replacements": {"a": 1}},
+                    {"llm_api": "cloud"}, {"input_device": 3}):
+            self.assertEqual(self.client.post("/settings", json=bad).status_code, 422, bad)
+        r = self.client.post("/settings", json={"replacements": {"STD": "STT"}, "paste_method": "shift_insert"})
+        self.assertEqual(r.status_code, 200, r.text)
+
     def test_bad_setting_type_returns_422(self) -> None:
         r = self.client.post("/settings", json={"cpu_threads": "4"})
         self.assertEqual(r.status_code, 422)
         self.assertIsInstance(zapp.app.state.config.cpu_threads, int)
+
+
+class TextAndHistoryTests(unittest.TestCase):
+    def test_replacements_whole_word_case_insensitive(self) -> None:
+        from core_stt import apply_replacements
+        self.assertEqual(apply_replacements("an STD test, std.", {"std": "STT"}), "an STT test, STT.")
+        self.assertEqual(apply_replacements("standard", {"std": "STT"}), "standard")
+        self.assertEqual(apply_replacements("मेरा फोन", {"फोन": "phone"}), "मेरा phone")
+
+    def test_repetition_loop_is_cut(self) -> None:
+        from core_stt import _REPEAT_RE
+        loop = "आवाज़ " * 8 + "end"
+        self.assertEqual(_REPEAT_RE.sub(r"\1 \1", loop), "आवाज़ आवाज़ end")
+        self.assertEqual(_REPEAT_RE.sub(r"\1 \1", "hello hello mic"), "hello hello mic")
+
+    def test_pinned_model_language(self) -> None:
+        import core_stt
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = core_stt.MODELS_DIR
+            core_stt.MODELS_DIR = Path(tmp)
+            core_stt._model_meta.cache_clear()
+            try:
+                (Path(tmp) / "hinglish").mkdir()
+                (Path(tmp) / "hinglish" / "zola.json").write_text('{"language": "en"}')
+                self.assertEqual(core_stt._pinned_language("hinglish"), "en")
+                self.assertIsNone(core_stt._pinned_language("small"))
+            finally:
+                core_stt.MODELS_DIR = saved
+                core_stt._model_meta.cache_clear()
+
+    def test_llm_answers_and_rewrites_are_rejected(self) -> None:
+        from core_llm import _plausible_edit
+        question = "can you tell me what is the capital of france i need it for the report"
+        self.assertFalse(_plausible_edit(question, "The capital of France is Paris.", "english"))
+        self.assertTrue(_plausible_edit(question, "Can you tell me what the capital of France is? I need it for the report.", "english"))
+        hinglish = "main English aur hindi donon mein baar baar switch karta raha hoon yah dekhane ke lie"
+        self.assertFalse(_plausible_edit(hinglish, "Main Hindi aur English, agar phirka aapki saaree kya ho jaata hai.", "preserve"))
+        self.assertTrue(_plausible_edit(hinglish, "Main English aur Hindi donon mein baar-baar switch karta raha hoon, yah dekhane ke lie.", "preserve"))
+
+    def test_history_survives_restart_and_clears(self) -> None:
+        from state import AppState, RecordingMode
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.json"
+            first = AppState(history_max=5, history_path=path)
+            asyncio.run(first.add_history(RecordingMode.BATCH, "namaste", 1.0))
+            second = AppState(history_max=5, history_path=path)
+            self.assertEqual(second.history[-1]["transcript"], "namaste")
+            asyncio.run(second.clear_history())
+            self.assertEqual(AppState(history_max=5, history_path=path).history, [])
+
+
+class ModelStoreTests(unittest.TestCase):
+    """Catalog downloads, without network: the source fetch is replaced."""
+
+    def setUp(self) -> None:
+        import model_store
+        self.store = model_store
+        self._tmp = tempfile.TemporaryDirectory()
+        self._saved = (model_store.MODELS_DIR, model_store._download_hf)
+        model_store.MODELS_DIR = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self.store.MODELS_DIR, self.store._download_hf = self._saved
+        self._tmp.cleanup()
+
+    def test_download_installs_atomically(self) -> None:
+        def fake_hf(repo, dest, progress):
+            (dest / "model.bin").write_bytes(b"x")
+            progress(1, 1)
+        self.store._download_hf = fake_hf
+        self.store.download("hinglish-swift", lambda done, total: None)
+        self.assertTrue(self.store.is_installed("hinglish-swift"))
+        self.assertEqual(sorted(p.name for p in Path(self._tmp.name).iterdir()), ["hinglish-swift"])
+
+    def test_failed_download_leaves_nothing(self) -> None:
+        def broken_hf(repo, dest, progress):
+            (dest / "model.bin").write_bytes(b"partial")
+            raise ConnectionError("network down")
+        self.store._download_hf = broken_hf
+        with self.assertRaises(ConnectionError):
+            self.store.download("hinglish-swift", lambda done, total: None)
+        self.assertEqual(list(Path(self._tmp.name).iterdir()), [])
+
+    def test_endpoints_validate_names_and_usage(self) -> None:
+        zapp.app.state.config = config.Config(**config._DEFAULTS)
+        zapp.app.state.downloads = {}
+        client = TestClient(zapp.app, base_url="http://127.0.0.1:5001")
+        names = [m["name"] for m in client.get("/models/catalog").json()["models"]]
+        self.assertIn("hinglish-swift", names)
+        self.assertEqual(client.post("/models/download", json={"name": "evil"}).status_code, 404)
+        self.assertEqual(client.post("/models/delete", json={"name": "hinglish-swift"}).status_code, 404)
+
+        (Path(self._tmp.name) / "hinglish-swift").mkdir()
+        (Path(self._tmp.name) / "hinglish-swift" / "zola.json").write_text("{}")
+        self.assertEqual(client.post("/models/download", json={"name": "hinglish-swift"}).status_code, 409)
+        zapp.app.state.config.whisper_batch = "hinglish-swift"
+        self.assertEqual(client.post("/models/delete", json={"name": "hinglish-swift"}).status_code, 409)
+        zapp.app.state.config.whisper_batch = "small"
+        self.assertEqual(client.post("/models/delete", json={"name": "hinglish-swift"}).status_code, 200)
+        self.assertFalse(self.store.is_installed("hinglish-swift"))
 
 
 if __name__ == "__main__":

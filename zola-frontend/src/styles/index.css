@@ -336,6 +336,11 @@ body::before {
   text-shadow: none;
 }
 
+.telemetry-value.warning {
+  color: var(--warning-red);
+  text-shadow: none;
+}
+
 /* Ledger (History) Table */
 .ledger-container {
   border: 1px solid var(--forest-green);

@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=[],
+    # sherpa_onnx is imported lazily (only for sherpa-onnx models), so it is
+    # listed explicitly together with its native libraries
+    binaries=collect_dynamic_libs('sherpa_onnx'),
     datas=collect_data_files('faster_whisper'),
-    hiddenimports=[],
+    hiddenimports=['sherpa_onnx'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

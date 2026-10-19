@@ -113,11 +113,24 @@ _ALL_KEYS = list({keycode for keycode, _ in _CHAR_MAP.values()} | {
     ecodes.KEY_LEFTSHIFT,
     ecodes.KEY_LEFTCTRL,
     ecodes.KEY_V,
+    ecodes.KEY_INSERT,
     ecodes.KEY_BACKSPACE,
     ecodes.KEY_SPACE,
     ecodes.KEY_ENTER,
     ecodes.KEY_TAB,
 })
+
+
+# Paste key combos (paste_method setting): modifiers held, then the key
+_PASTE_KEYS = {
+    "ctrl_v": ([ecodes.KEY_LEFTCTRL], ecodes.KEY_V),
+    "ctrl_shift_v": ([ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTSHIFT], ecodes.KEY_V),
+    "shift_insert": ([ecodes.KEY_LEFTSHIFT], ecodes.KEY_INSERT),
+}
+
+# How long the pasted text stays in the clipboard before the previous
+# content is restored; the target app reads it asynchronously after the keys.
+_RESTORE_DELAY_S = 0.5
 
 
 def _text_is_ascii_only(text: str) -> bool:
@@ -180,7 +193,13 @@ class KeystrokeInjector:
     # ----------------------------------------------------------------------- #
     # Primary injection path — clipboard paste (Unicode-safe)
     # ----------------------------------------------------------------------- #
-    async def inject_text(self, text: str, delay_ms: int = 12) -> None:
+    async def inject_text(
+        self,
+        text: str,
+        delay_ms: int = 12,
+        paste_method: str = "ctrl_v",
+        restore_clipboard: bool = False,
+    ) -> None:
         """
         Main entry point for injecting transcribed text into the focused app.
 
@@ -198,8 +217,12 @@ class KeystrokeInjector:
             return
 
         # Attempt 1: clipboard paste (primary — Unicode-safe)
-        paste_ok = await self._clipboard_paste(text, delay_ms)
+        previous = await self._read_clipboard() if restore_clipboard else None
+        paste_ok = await self._clipboard_paste(text, delay_ms, paste_method)
         if paste_ok:
+            if previous is not None:
+                await asyncio.sleep(_RESTORE_DELAY_S)
+                await self._wl_copy(previous)
             return
 
         # Attempt 2: uinput fallback (ASCII only — logs skipped non-ASCII chars)
@@ -213,9 +236,42 @@ class KeystrokeInjector:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self.type_text, text, delay_ms)
 
-    async def _clipboard_paste(self, text: str, delay_ms: int = 12) -> bool:
+    async def _read_clipboard(self) -> str | None:
+        """Current clipboard text, or None if empty / not text / unavailable."""
+        if self._missing_wayland_env():
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "wl-paste", "--no-newline", "--type", "text/plain;charset=utf-8",
+                env=self._wayland_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            return out.decode("utf-8") if proc.returncode == 0 else None
+        except (FileNotFoundError, asyncio.TimeoutError, UnicodeDecodeError):
+            return None
+
+    async def _wl_copy(self, text: str, primary: bool = False) -> bool:
+        """Put text into the clipboard (or the primary selection). True on success."""
+        args = ["wl-copy"] + (["--primary"] if primary else []) + ["--", text]
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            env=self._wayland_env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
+            logger.error("KeystrokeInjector: wl-copy exited %d: %s", proc.returncode, err)
+            return False
+        return True
+
+    async def _clipboard_paste(self, text: str, delay_ms: int = 12, paste_method: str = "ctrl_v") -> bool:
         """
-        Copy text to Wayland clipboard with wl-copy, then simulate Ctrl+V.
+        Copy text to Wayland clipboard with wl-copy, then send the paste keys.
+        shift_insert also fills the primary selection, which terminals paste.
         Returns True on success, False on any failure (caller should fallback).
         """
         missing_env = self._missing_wayland_env()
@@ -228,27 +284,16 @@ class KeystrokeInjector:
 
         try:
             # Step 1: write to clipboard
-            proc = await asyncio.create_subprocess_exec(
-                "wl-copy", "--", text,
-                env=self._wayland_env,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-
-            if proc.returncode != 0:
-                err = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
-                logger.error(
-                    "KeystrokeInjector._clipboard_paste: wl-copy exited %d: %s",
-                    proc.returncode, err,
-                )
+            if not await self._wl_copy(text):
+                return False
+            if paste_method == "shift_insert" and not await self._wl_copy(text, primary=True):
                 return False
 
-            # Step 2: simulate Ctrl+V to paste into the focused window
+            # Step 2: send the paste keys to the focused window
             # Small settle delay so the compositor processes the clipboard write
             await asyncio.sleep(0.05)
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._send_ctrl_v, delay_ms)
+            await loop.run_in_executor(None, self._send_paste, paste_method, delay_ms)
 
             logger.debug(
                 "KeystrokeInjector._clipboard_paste: pasted %d chars via wl-copy+Ctrl+V",
@@ -269,18 +314,21 @@ class KeystrokeInjector:
             logger.exception("KeystrokeInjector._clipboard_paste: unexpected error: %s", exc)
             return False
 
-    def _send_ctrl_v(self, delay_ms: int = 12) -> None:
-        """Simulate Ctrl+V keystroke via uinput to trigger paste in the focused app."""
+    def _send_paste(self, paste_method: str = "ctrl_v", delay_ms: int = 12) -> None:
+        """Send the paste key combo via uinput to trigger paste in the focused app."""
         delay_s = delay_ms / 1000.0
+        modifiers, key = _PASTE_KEYS.get(paste_method, _PASTE_KEYS["ctrl_v"])
         try:
-            self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 1)
-            self._ui.write(ecodes.EV_KEY, ecodes.KEY_V, 1)
-            self._ui.write(ecodes.EV_KEY, ecodes.KEY_V, 0)
-            self._ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 0)
+            for mod in modifiers:
+                self._ui.write(ecodes.EV_KEY, mod, 1)
+            self._ui.write(ecodes.EV_KEY, key, 1)
+            self._ui.write(ecodes.EV_KEY, key, 0)
+            for mod in reversed(modifiers):
+                self._ui.write(ecodes.EV_KEY, mod, 0)
             self._ui.syn()
             time.sleep(delay_s)
         except Exception as exc:
-            logger.error("KeystrokeInjector._send_ctrl_v: error: %s", exc)
+            logger.error("KeystrokeInjector._send_paste: error: %s", exc)
             self.release_all()
 
     # ----------------------------------------------------------------------- #

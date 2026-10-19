@@ -25,6 +25,7 @@ from typing import Any, Set
 from urllib.parse import urlparse
 
 import httpx
+import psutil
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +37,19 @@ CONFIG_PATH = CONFIG_DIR / "settings.json"
 
 _LEGACY_CONFIG_PATH = Path.home() / ".config" / "speaktype" / "settings.json"
 
+# Extra models live in one folder each under ~/.local/share/zola/models/<name>/:
+#   - CTranslate2 Whisper models (e.g. fine-tunes): model.bin + tokenizer.json
+#   - sherpa-onnx transducers (e.g. NVIDIA Nemotron 3.5): encoder/decoder/joiner
+#     *.onnx + tokens.txt, with {"engine": "sherpa-transducer"} in zola.json
+# zola.json can also pin the language token a model needs,
+# e.g. {"language": "en"} for Oriserve Hindi2Hinglish (romanized output).
+MODELS_DIR = Path.home() / ".local" / "share" / "zola" / "models"
+
 VALID_WHISPER_SIZES = {
     "tiny", "base", "small", "medium",
     "large-v2", "large-v3",
     "large-v3-turbo",   # 6x faster than large-v3, negligible accuracy loss
+    "tiny.en", "base.en", "small.en",  # English-only: faster and more accurate for English
     "distil-large-v3",  # DEPRECATED for multilingual — 89% WER on Hindi, auto-translates to English
 }
 # CPU-only: float16 variants need a GPU and make CTranslate2 refuse to load.
@@ -62,6 +72,9 @@ _DEFAULTS: dict[str, Any] = {
     "ollama_model": "llama3.2",
     # ollama_url MUST be a loopback address. Validated in __post_init__.
     "ollama_url": "http://127.0.0.1:11434",
+    # ollama = Ollama /api/generate; openai = any OpenAI-compatible local
+    # server (llama.cpp server, LM Studio, vLLM) at ollama_url /v1/chat/completions
+    "llm_api": "ollama",
 
     # ── Speech-to-Text (faster-whisper) ───────────────────────────────────────
     # Realtime model: keep small for low latency on CPU.
@@ -70,9 +83,10 @@ _DEFAULTS: dict[str, Any] = {
     # vs. 'small' with only moderate extra RAM (~1.6 GB vs ~500 MB).
     "whisper_batch": "small",
     "compute_type": "int8",
-    # Set to physical core count, NOT logical thread count.
-    # CTranslate2 (oneDNN) performs better at physical core count.
-    "cpu_threads": 2,
+    # Physical core count, NOT logical thread count: on a 2-core/4-thread
+    # i3 both engines ran ~25-100% slower with 4 threads than with 2
+    # (STT_EVALUATION.md). Capped at 4 to leave cores for the desktop.
+    "cpu_threads": max(1, min(4, psutil.cpu_count(logical=False) or 2)),
 
     # ── Language & Output ─────────────────────────────────────────────────────
     # spoken_language: what you speak into the mic.
@@ -99,8 +113,25 @@ _DEFAULTS: dict[str, Any] = {
     # 0 = no cap (not recommended).
     "max_record_duration_s": 300,
 
+    # Microphone name (as listed by GET /devices); null = system default
+    "input_device": None,
+    # Short start/stop tones, so hotkey use gives feedback without the UI
+    "audio_feedback": True,
+
     # ── Keystroke Injection (evdev / clipboard) ───────────────────────────────
     "typing_delay_ms": 12,
+    # Key combo sent after copying the text:
+    #   ctrl_v       = most apps
+    #   ctrl_shift_v = terminal emulators
+    #   shift_insert = works in both GTK/Qt apps and most terminals
+    "paste_method": "ctrl_v",
+    # Put the previous clipboard text back after pasting
+    "restore_clipboard": False,
+
+    # ── Corrections ───────────────────────────────────────────────────────────
+    # Whole-word, case-insensitive fixes applied to every transcript,
+    # e.g. {"STD": "STT", "zola": "ZOLA"}
+    "replacements": {},
 
     # ── Realtime Transcription ────────────────────────────────────────────────
     # Raised to 0.7s (from 0.5s) for better Hindi/Hinglish utterance segmentation.
@@ -116,6 +147,8 @@ _DEFAULTS: dict[str, Any] = {
 
     # ── History ───────────────────────────────────────────────────────────────
     "history_max": 50,
+    # Keep history across restarts in ~/.local/share/zola/history.json
+    "save_history": True,
 
     # ── Active Mode & Keybinding ──────────────────────────────────────────────
     # batch | batch-llm | batch-translate | realtime | realtime-llm
@@ -137,6 +170,7 @@ class Config:
     """
     ollama_model: str
     ollama_url: str
+    llm_api: str
     whisper_realtime: str
     whisper_batch: str
     compute_type: str
@@ -147,7 +181,12 @@ class Config:
     initial_prompt: str | None
     sample_rate: int
     max_record_duration_s: float
+    input_device: str | None
+    audio_feedback: bool
     typing_delay_ms: int
+    paste_method: str
+    restore_clipboard: bool
+    replacements: dict
     realtime_utterance_silence_s: float
     realtime_force_commit_s: float
     realtime_chunk_s: float
@@ -155,6 +194,7 @@ class Config:
     batch_silence_timeout_s: float
     batch_min_record_s: float
     history_max: int
+    save_history: bool
     active_mode: str
     keybinding: str
     first_run_completed: bool
@@ -164,6 +204,7 @@ class Config:
         return {
             "ollama_model": self.ollama_model,
             "ollama_url": self.ollama_url,
+            "llm_api": self.llm_api,
             "whisper_realtime": self.whisper_realtime,
             "whisper_batch": self.whisper_batch,
             "compute_type": self.compute_type,
@@ -174,7 +215,12 @@ class Config:
             "initial_prompt": self.initial_prompt,
             "sample_rate": self.sample_rate,
             "max_record_duration_s": self.max_record_duration_s,
+            "input_device": self.input_device,
+            "audio_feedback": self.audio_feedback,
             "typing_delay_ms": self.typing_delay_ms,
+            "paste_method": self.paste_method,
+            "restore_clipboard": self.restore_clipboard,
+            "replacements": dict(self.replacements),
             "realtime_utterance_silence_s": self.realtime_utterance_silence_s,
             "realtime_force_commit_s": self.realtime_force_commit_s,
             "realtime_chunk_s": self.realtime_chunk_s,
@@ -182,6 +228,7 @@ class Config:
             "batch_silence_timeout_s": self.batch_silence_timeout_s,
             "batch_min_record_s": self.batch_min_record_s,
             "history_max": self.history_max,
+            "save_history": self.save_history,
             "active_mode": self.active_mode,
             "keybinding": self.keybinding,
             "first_run_completed": self.first_run_completed,
@@ -200,6 +247,10 @@ class Config:
                 ok = isinstance(value, int) and not isinstance(value, bool)
             elif expected in (str, bool):
                 ok = isinstance(value, expected)
+            elif expected is dict:
+                ok = isinstance(value, dict) and all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+                )
             else:  # str | None
                 ok = value is None or isinstance(value, str)
             if not ok:
@@ -213,15 +264,16 @@ class Config:
             )
 
         # ── Whisper model sizes ──
-        if self.whisper_realtime not in VALID_WHISPER_SIZES:
+        valid_models = VALID_WHISPER_SIZES | set(installed_models())
+        if self.whisper_realtime not in valid_models:
             raise ValueError(
                 f"whisper_realtime '{self.whisper_realtime}' is invalid. "
-                f"Valid: {sorted(VALID_WHISPER_SIZES)}"
+                f"Valid: {sorted(valid_models)}"
             )
-        if self.whisper_batch not in VALID_WHISPER_SIZES:
+        if self.whisper_batch not in valid_models:
             raise ValueError(
                 f"whisper_batch '{self.whisper_batch}' is invalid. "
-                f"Valid: {sorted(VALID_WHISPER_SIZES)}"
+                f"Valid: {sorted(valid_models)}"
             )
 
         # ── Compute type ──
@@ -248,6 +300,11 @@ class Config:
             raise ValueError(
                 f"spoken_language '{self.spoken_language}' is invalid. Valid: {sorted(valid_spoken)}"
             )
+
+        if self.llm_api not in ("ollama", "openai"):
+            raise ValueError("llm_api must be 'ollama' or 'openai'.")
+        if self.paste_method not in ("ctrl_v", "ctrl_shift_v", "shift_insert"):
+            raise ValueError("paste_method must be 'ctrl_v', 'ctrl_shift_v' or 'shift_insert'.")
 
         valid_output = {"preserve", "english"}
         if self.output_language not in valid_output:
@@ -284,6 +341,17 @@ class Config:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+def installed_models() -> list[str]:
+    """Names of the model folders found in MODELS_DIR."""
+    if not MODELS_DIR.is_dir():
+        return []
+    return sorted(
+        p.name for p in MODELS_DIR.iterdir()
+        if not p.name.startswith(".")  # .partial-* = download in progress
+        and ((p / "model.bin").is_file() or (p / "zola.json").is_file())
+    )
+
+
 def load_config() -> Config:
     """
     Load configuration from settings.json.

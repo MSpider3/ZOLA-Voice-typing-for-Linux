@@ -6,6 +6,7 @@ Prevents race conditions from rapid duplicate trigger events.
 """
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -37,6 +38,10 @@ def _get_zola_runtime_dir() -> Path:
         base = Path(f"/tmp/zola-{uid}")  # nosec B108
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     return base
+
+
+# Saved transcription history (when the save_history setting is on)
+HISTORY_PATH = Path.home() / ".local" / "share" / "zola" / "history.json"
 
 
 def make_audio_tmp_path() -> Path:
@@ -74,14 +79,15 @@ class AppState:
     """
 
     __slots__ = (
-        '_lock', '_history_max', '_start_time',
+        '_lock', '_history_max', '_start_time', '_history_path',
         'is_recording', 'active_mode', 'current_audio_path',
         'realtime_task', 'history',
     )
 
-    def __init__(self, history_max: int = 50) -> None:
+    def __init__(self, history_max: int = 50, history_path: Path | None = None) -> None:
         self._lock = asyncio.Lock()
         self._history_max = history_max
+        self._history_path = history_path
 
         self.is_recording: bool = False
         self.active_mode: RecordingMode | None = None
@@ -91,6 +97,12 @@ class AppState:
         self.realtime_task: asyncio.Task | None = None
         self.history: list[dict[str, Any]] = []
         self._start_time: float = time.monotonic()
+
+        if history_path and history_path.is_file():
+            try:
+                self.history = json.loads(history_path.read_text(encoding="utf-8"))[-history_max:]
+            except (OSError, ValueError) as exc:
+                logger.error("Could not read saved history %s: %s", history_path, exc)
 
         logger.debug("AppState initialised")
 
@@ -167,11 +179,34 @@ class AppState:
             self.history.append(entry)
             if len(self.history) > self._history_max:
                 self.history = self.history[-self._history_max:]
+            self._save_history()
             logger.debug(
                 "History entry added (total: %d): %d chars",
                 len(self.history),
                 len(transcript),
             )
+
+    async def clear_history(self) -> None:
+        """Forget all entries, including the saved file."""
+        async with self._lock:
+            self.history = []
+            self._save_history()
+
+    def set_history_path(self, path: Path | None) -> None:
+        """Start (path) or stop (None) saving history to disk."""
+        self._history_path = path
+        self._save_history()
+
+    def _save_history(self) -> None:
+        if not self._history_path:
+            return
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._history_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.history, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._history_path)
+        except OSError as exc:
+            logger.error("Could not save history to %s: %s", self._history_path, exc)
 
     # ----------------------------------------------------------------------- #
     # Status Snapshot

@@ -10,6 +10,9 @@ uvicorn[standard]>=0.32.0
 
 # --- Speech-to-Text (CTranslate2 backend, int8 quantized) ---
 faster-whisper>=1.1.0
+# Optional engine for sherpa-onnx models such as NVIDIA Nemotron 3.5
+# (tools/install_nemotron_model.sh); imported only when such a model is selected
+sherpa-onnx>=1.13.8
 
 # --- Audio Capture (PipeWire via PortAudio PulseAudio compat) ---
 sounddevice>=0.5.0

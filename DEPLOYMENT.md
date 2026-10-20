@@ -18,8 +18,8 @@ The project features a fully automated release pipeline in `.github/workflows/re
    ```
 2. GitHub Actions will spin up a builder container to:
    - Compile the **Python Daemon** into a single frozen binary executable (`zola-daemon`) using PyInstaller.
-   - Build the **Tauri Frontend** AppImage (`Zola.AppImage`).
-   - Automatically compile them and attach them to a new GitHub Release under the corresponding version tag.
+   - Copy it into `zola-frontend/src-tauri/binaries/` as a Tauri sidecar, so the `.rpm`, `.deb` and `.AppImage` each contain the app **and** the daemon (the app starts it when no daemon is running).
+   - Attach the bundles, the standalone `zola-daemon` (used only by `install.sh` for its systemd service) and `checksums.txt` to the GitHub Release for that tag.
 
 ---
 
@@ -60,8 +60,15 @@ If you are developing locally or testing without pushing to GitHub, you can buil
    ```bash
    cd zola-frontend
    ```
-2. Install dependencies and compile the AppImage:
+   Tauri requires the bundled daemon file to exist even for `npm run tauri dev`. Build it as in step 2, or for UI-only work create an empty placeholder (the app then uses a daemon you start yourself):
    ```bash
+   mkdir -p src-tauri/binaries && touch "src-tauri/binaries/zola-daemon-$(rustc -vV | sed -n 's/^host: //p')"
+   ```
+2. Build the daemon first and place it as the sidecar, then compile the bundles:
+   ```bash
+   (cd ../zola-backend && pyinstaller zola-daemon.spec)
+   mkdir -p src-tauri/binaries
+   cp ../zola-backend/dist/zola-daemon "src-tauri/binaries/zola-daemon-$(rustc -vV | sed -n 's/^host: //p')"
    npm install
    npm run tauri build
    ```

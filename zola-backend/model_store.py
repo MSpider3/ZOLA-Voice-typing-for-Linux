@@ -12,6 +12,7 @@ Downloads go to MODELS_DIR/.partial-<name>/ and are renamed into place only
 when complete, so a cancelled or failed download never leaves a half model.
 """
 
+import hashlib
 import json
 import logging
 import shutil
@@ -33,7 +34,9 @@ CATALOG: dict[str, dict] = {
         "description": "Recommended for Hindi and Hinglish. Writes Roman script. "
                        "Hindi 10% / Hinglish 12% WER, ~1 s per sentence on a 2-core CPU.",
         "size_mb": 78,
-        "source": {"type": "huggingface", "repo": "MSpider3/whisper-hindi2hinglish-swift-ct2"},
+        # Pinned commit: a later push to the repo changes nothing until a release updates this
+        "source": {"type": "huggingface", "repo": "MSpider3/whisper-hindi2hinglish-swift-ct2",
+                   "revision": "484362f23d657c07c2762ce1c52d7b4a7ab49d25"},
     },
     "nemotron-3.5": {
         "label": "Nemotron 3.5 (NVIDIA, int8) — Devanagari Hindi + English, best English accuracy",
@@ -44,6 +47,7 @@ CATALOG: dict[str, dict] = {
             "type": "tar",
             "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
                    "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2",
+            "sha256": "c6bf5e0df765f9d5b43bc9e0536d4b4b3e7d40bdf5ecf13e45f134c51c05ae3a",
             "files": ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"],
         },
         "zola": {
@@ -72,9 +76,9 @@ def download(name: str, progress: Progress) -> None:
     try:
         source = entry["source"]
         if source["type"] == "huggingface":
-            _download_hf(source["repo"], partial, progress)
+            _download_hf(source["repo"], source["revision"], partial, progress)
         else:
-            _download_tar(source["url"], source["files"], partial, progress)
+            _download_tar(source["url"], source["sha256"], source["files"], partial, progress)
         if "zola" in entry:
             meta = {"label": entry["label"], **entry["zola"]}
             (partial / "zola.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -106,25 +110,28 @@ def _stream(client: httpx.Client, url: str, dest: Path, done: int, total: int, p
     return done
 
 
-def _download_hf(repo: str, dest: Path, progress: Progress) -> None:
+def _download_hf(repo: str, revision: str, dest: Path, progress: Progress) -> None:
     from huggingface_hub import HfApi  # installed with faster-whisper
 
-    info = HfApi().model_info(repo, files_metadata=True)
+    info = HfApi().model_info(repo, revision=revision, files_metadata=True)
     files = [s for s in info.siblings if not s.rfilename.startswith(".") and "/" not in s.rfilename]
     total, done = sum(s.size or 0 for s in files), 0
     with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0, read=120.0)) as client:
         for s in files:
-            url = f"https://huggingface.co/{repo}/resolve/{info.sha}/{s.rfilename}"
+            url = f"https://huggingface.co/{repo}/resolve/{revision}/{s.rfilename}"
             done = _stream(client, url, dest / s.rfilename, done, total, progress)
 
 
-def _download_tar(url: str, members: list[str], dest: Path, progress: Progress) -> None:
+def _download_tar(url: str, sha256: str, members: list[str], dest: Path, progress: Progress) -> None:
     with tempfile.TemporaryDirectory(dir=MODELS_DIR) as tmp:
         archive = Path(tmp) / "model.tar.bz2"
         with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0, read=120.0)) as client:
             with client.stream("HEAD", url) as head:
                 total = int(head.headers.get("content-length", 0))
             _stream(client, url, archive, 0, total, progress)
+        with open(archive, "rb") as fh:
+            if hashlib.file_digest(fh, "sha256").hexdigest() != sha256:
+                raise RuntimeError("downloaded archive does not match its expected SHA-256")
         # Copy only the expected files by basename (no path from the archive is used)
         wanted = set(members)
         with tarfile.open(archive, "r:bz2") as tar:

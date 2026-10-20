@@ -6,6 +6,7 @@ No daemon, microphone or model needed. Run from the repo root:
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -68,6 +69,17 @@ class ConfigTests(_TempConfig):
             with self.assertRaises(ValueError, msg=str(bad)):
                 config.update_config(cfg, dict(bad))
             self.assertEqual(cfg.to_dict(), before, msg=str(bad))
+
+    def test_one_invalid_setting_keeps_the_others(self) -> None:
+        cfg = config.load_config()
+        config.update_config(cfg, {"paste_method": "shift_insert", "replacements": {"STD": "STT"}})
+        saved = json.loads(config.CONFIG_PATH.read_text(encoding="utf-8"))
+        saved["whisper_batch"] = "deleted-model-folder"
+        config.CONFIG_PATH.write_text(json.dumps(saved), encoding="utf-8")
+        reloaded = config.load_config()
+        self.assertEqual(reloaded.whisper_batch, config._DEFAULTS["whisper_batch"])
+        self.assertEqual(reloaded.paste_method, "shift_insert")
+        self.assertEqual(reloaded.replacements, {"STD": "STT"})
 
     def test_invalid_file_is_backed_up_before_reset(self) -> None:
         config.CONFIG_PATH.write_text("{ not json", encoding="utf-8")
@@ -253,7 +265,7 @@ class ModelStoreTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_download_installs_atomically(self) -> None:
-        def fake_hf(repo, dest, progress):
+        def fake_hf(repo, revision, dest, progress):
             (dest / "model.bin").write_bytes(b"x")
             progress(1, 1)
         self.store._download_hf = fake_hf
@@ -262,12 +274,47 @@ class ModelStoreTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in Path(self._tmp.name).iterdir()), ["hinglish-swift"])
 
     def test_failed_download_leaves_nothing(self) -> None:
-        def broken_hf(repo, dest, progress):
+        def broken_hf(repo, revision, dest, progress):
             (dest / "model.bin").write_bytes(b"partial")
             raise ConnectionError("network down")
         self.store._download_hf = broken_hf
         with self.assertRaises(ConnectionError):
             self.store.download("hinglish-swift", lambda done, total: None)
+        self.assertEqual(list(Path(self._tmp.name).iterdir()), [])
+
+    def test_archive_with_wrong_checksum_is_rejected(self) -> None:
+        import io
+        import tarfile
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:bz2") as tar:
+            for name in self.store.CATALOG["nemotron-3.5"]["source"]["files"]:
+                info = tarfile.TarInfo(f"model/{name}")
+                info.size = 1
+                tar.addfile(info, io.BytesIO(b"x"))
+
+        def fake_stream(client, url, dest, done, total, progress):
+            dest.write_bytes(buf.getvalue())
+            return done
+
+        class _Client:
+            def __init__(self, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def stream(self, method, url):
+                class _Head:
+                    headers = {}
+                    def __enter__(self): return self
+                    def __exit__(self, *args): pass
+                return _Head()
+
+        saved = (self.store._stream, self.store.httpx.Client)
+        self.store._stream, self.store.httpx.Client = fake_stream, _Client
+        try:
+            with self.assertRaises(RuntimeError):
+                self.store.download("nemotron-3.5", lambda done, total: None)
+        finally:
+            self.store._stream, self.store.httpx.Client = saved
         self.assertEqual(list(Path(self._tmp.name).iterdir()), [])
 
     def test_endpoints_validate_names_and_usage(self) -> None:

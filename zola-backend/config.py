@@ -125,7 +125,8 @@ _DEFAULTS: dict[str, Any] = {
     #   ctrl_shift_v = terminal emulators
     #   shift_insert = works in both GTK/Qt apps and most terminals
     "paste_method": "ctrl_v",
-    # Put the previous clipboard text back after pasting
+    # Put the previous clipboard text back after pasting (text only: a copied
+    # image or file is replaced by the transcript)
     "restore_clipboard": False,
 
     # ── Corrections ───────────────────────────────────────────────────────────
@@ -398,10 +399,20 @@ def load_config() -> Config:
             save_config(cfg)
         return cfg
     except (TypeError, ValueError) as exc:
-        logger.error("Config validation failed: %s — reverting to defaults", exc)
+        # Reset only the invalid settings (e.g. a deleted model folder), keeping
+        # the rest. Keys are tried one at a time on top of the defaults.
+        logger.error("Config validation failed: %s — resetting the invalid settings", exc)
         _backup_config()
-        _write_defaults()
-        return Config(**_DEFAULTS)
+        good = dict(_DEFAULTS)
+        for key, value in merged.items():
+            try:
+                Config(**{**good, key: value})
+                good[key] = value
+            except (TypeError, ValueError) as key_exc:
+                logger.error("Config: '%s' reset to default %r (%s)", key, _DEFAULTS[key], key_exc)
+        cfg = Config(**good)
+        save_config(cfg)
+        return cfg
 
 
 def save_config(cfg: Config) -> None:

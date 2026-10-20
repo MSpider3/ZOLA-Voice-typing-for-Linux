@@ -125,22 +125,7 @@ if [ -t 0 ]; then
     mkdir -p "$ZOLA_CONF_DIR"
     ZOLA_CONF_FILE="$ZOLA_CONF_DIR/settings.json"
     
-    echo -e "\n${YELLOW}=== 1. Hardware Profile ===${NC}"
-    echo "1) Light (Low-spec laptops, fast but less accurate)"
-    echo "2) Balanced (Most modern laptops)"
-    echo "3) Accurate (High-end CPU/M-series, downloads ~1.5GB model)"
-    read -r -p "Select profile [2]: " hw_choice
-    case "$hw_choice" in
-        1) w_real="tiny"; w_batch="base" ;;
-        3) w_real="small"; w_batch="large-v3-turbo" ;;
-        4) 
-            log_warn "Nemotron modular engine support is slated for v1.3.0. Defaulting to Balanced profile."
-            w_real="base"; w_batch="small"
-            ;;
-        *) w_real="base"; w_batch="small" ;;
-    esac
-
-    echo -e "\n${YELLOW}=== 2. Primary Language ===${NC}"
+    echo -e "\n${YELLOW}=== 1. Primary Language ===${NC}"
     echo "1) English"
     echo "2) Hindi"
     echo "3) Hinglish (Mixed)"
@@ -153,7 +138,29 @@ if [ -t 0 ]; then
         *) s_lang="auto" ;;
     esac
 
-    echo -e "\n${YELLOW}=== 3. Checking Ollama Integration ===${NC}"
+    # Standard Whisper models cannot transcribe Hindi well (STT_EVALUATION.md).
+    # For Hindi/Hinglish the app's first-run setup downloads the right model,
+    # so only English needs a model choice here.
+    models_json=""
+    first_run="false"
+    if [ "$s_lang" = "en" ]; then
+        echo -e "\n${YELLOW}=== 2. Hardware Profile ===${NC}"
+        echo "1) Light (Low-spec laptops, fastest)"
+        echo "2) Balanced (Most laptops)"
+        echo "3) Accurate (High-end CPU, downloads ~1.5GB model)"
+        read -r -p "Select profile [2]: " hw_choice
+        case "$hw_choice" in
+            1) w_real="base.en"; w_batch="base.en" ;;
+            3) w_real="small.en"; w_batch="large-v3-turbo" ;;
+            *) w_real="base.en"; w_batch="small.en" ;;
+        esac
+        models_json="\"whisper_realtime\": \"$w_real\", \"whisper_batch\": \"$w_batch\", "
+        first_run="true"
+    else
+        log_info "Open Zola once after installing: it downloads the Hindi/Hinglish model (78-450 MB) and switches to it."
+    fi
+
+    echo -e "\n${YELLOW}=== Checking Ollama Integration ===${NC}"
     if curl -s -m 2 http://127.0.0.1:11434/api/tags | grep -q "name"; then
         log_success "Found local Ollama instance."
     else
@@ -161,12 +168,7 @@ if [ -t 0 ]; then
     fi
 
     cat > "$ZOLA_CONF_FILE" << JSON_CONF
-{
-  "whisper_realtime": "$w_real",
-  "whisper_batch": "$w_batch",
-  "spoken_language": "$s_lang",
-  "first_run_completed": true
-}
+{ ${models_json}"spoken_language": "$s_lang", "first_run_completed": $first_run }
 JSON_CONF
     log_success "Saved configuration to $ZOLA_CONF_FILE"
     echo -e "\n"

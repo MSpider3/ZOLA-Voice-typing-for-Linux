@@ -5,6 +5,7 @@ All notable changes to the Zola Voice Typing project will be documented in this 
 ## [v1.3.0] - 2026-10-20
 
 ### Added
+- **One package with app and daemon**: the `.rpm`, `.deb` and `.AppImage` now contain the speech daemon (Tauri sidecar) and the app starts it when none is running; the `.rpm`/`.deb` also install the `/dev/uinput` access rule. The separate `zola-daemon` download is only needed by `install.sh`.
 - **STT evaluation for weak CPUs** (`STT_EVALUATION.md`): 12 models tested offline on English, Hindi and Hinglish speech, clean and noisy, on a 2-core laptop CPU.
 - **Extra model folders** in `~/.local/share/zola/models/`, listed in Settings with their labels; `zola.json` can pin a model's language token or select the sherpa-onnx engine.
 - **In-app model downloads** (Settings → MODELS, `GET /models/catalog`, `POST /models/download`, `POST /models/delete`) with live progress; fixed sources only, installed atomically.
@@ -22,6 +23,13 @@ All notable changes to the Zola Voice Typing project will be documented in this 
 - **Hinglish priming warning** was logged on every transcription; now once.
 - **LLM refinement answered dictated questions or rewrote the text** with small models; the transcript is now marked as data, reasoning models run with thinking off, and outputs that are not a plausible correction are discarded.
 - **`cpu_threads` default** follows the physical core count (more threads were 25-100% slower on a 2-core/4-thread CPU).
+- **First-run setup for Hindi/Hinglish** downloads Hinglish Swift (or Nemotron 3.5 for Devanagari) and switches to it; standard Whisper sizes measured 84-97% WER on Hindi. `install.sh` asks for a model only for English.
+- **One invalid setting no longer resets all settings**: only the invalid keys (e.g. a deleted model folder) fall back to their defaults.
+- **`/dev/uinput` access check** replaces the misleading "not in the input group" warning, which fired even when the uaccess rule worked.
+- **Model downloads are pinned**: Hinglish Swift to a fixed repository commit, Nemotron to the release archive's SHA-256.
+- **The app does not start a second daemon** while one is still loading at login; the bundled daemon logs to `~/.local/state/zola/daemon.log`.
+- **CI runs the regression tests** before building a release.
+- Removed unused code: the template `greet` command, the opener plugin, `erase_chars()`, and the installer's stale Nemotron option.
 
 ## [1.2.0] - 2026-10-02
 

@@ -34,6 +34,21 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "externalBin": [
+      "binaries/zola-daemon"
+    ],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/lib/udev/rules.d/70-zola-uinput.rules": "resources/70-zola-uinput.rules"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/lib/udev/rules.d/70-zola-uinput.rules": "resources/70-zola-uinput.rules"
+        }
+      }
+    }
   }
 }

@@ -20,7 +20,6 @@ Start the server:
 """
 
 import asyncio
-import grp
 import json
 import logging
 import os
@@ -74,33 +73,20 @@ _last_trigger_time: float = 0.0
 # --------------------------------------------------------------------------- #
 # Startup checks
 # --------------------------------------------------------------------------- #
-def _check_input_group() -> None:
+def _check_uinput_access() -> None:
     """
-    Warn clearly if the current user is not in the 'input' group.
-    The injector will fail with PermissionError if this isn't set up.
-    This check runs before the injector is created so the error message
-    is readable rather than a raw traceback.
+    Warn clearly if /dev/uinput is not writable, before the injector fails
+    with a raw PermissionError. Access normally comes from the logged-in
+    session (udev 'uaccess' rule from the rpm/deb or install.sh), not a group.
     """
-    try:
-        input_gid = grp.getgrnam("input").gr_gid
-        user_groups = os.getgroups()
-        if input_gid not in user_groups:
-            logger.warning(
-                "User is NOT in the 'input' group — /dev/uinput will be inaccessible.\n"
-                "Fix with these one-time commands:\n"
-                "  sudo usermod -aG input $USER\n"
-                "  echo 'KERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\"' | "
-                "sudo tee /etc/udev/rules.d/99-uinput.rules\n"
-                "  sudo udevadm control --reload-rules && sudo udevadm trigger\n"
-                "Then log out and back in (or reboot) for group membership to take effect."
-            )
-    except KeyError:
+    if not os.access("/dev/uinput", os.W_OK):
         logger.warning(
-            "Could not find 'input' group on this system. "
-            "The daemon may fail to open /dev/uinput."
+            "/dev/uinput is not writable — Zola cannot type text.\n"
+            "Fix with these one-time commands, then log out and back in:\n"
+            "  echo 'KERNEL==\"uinput\", TAG+=\"uaccess\", OPTIONS+=\"static_node=uinput\"' | "
+            "sudo tee /etc/udev/rules.d/70-zola-uinput.rules\n"
+            "  sudo udevadm control --reload-rules && sudo udevadm trigger"
         )
-    except Exception as exc:
-        logger.debug("_check_input_group: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -112,7 +98,7 @@ async def lifespan(app: FastAPI):
     logger.info("Zola daemon starting up…")
     logger.info("=" * 60)
 
-    _check_input_group()
+    _check_uinput_access()
 
     cfg: Config = load_config()
     app.state.config = cfg

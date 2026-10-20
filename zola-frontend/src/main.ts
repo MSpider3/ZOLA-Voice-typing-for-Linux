@@ -213,23 +213,27 @@ async function bootstrap() {
           else if (hw === 'accurate') { w_real = 'small'; w_batch = 'large-v3-turbo'; }
 
           // Benchmarked on a 2-core i3 (STT_EVALUATION.md): English-only models are
-          // faster and more accurate for English; the Hinglish fine-tune is
-          // ~10x faster than 'small' and far more accurate for Hindi/Hinglish,
-          // but it writes Roman script, so not for strict-Devanagari Hindi.
+          // faster and more accurate for English. Standard Whisper sizes cannot
+          // transcribe Hindi well, so Hindi/Hinglish get a downloaded model:
+          // Hinglish Swift (Roman script) or Nemotron 3.5 (Devanagari).
+          let downloadModel: string | null = null;
           if (lang === 'en') {
             w_real = 'base.en';
             w_batch = hw === 'light' ? 'base.en' : 'small.en';
-          } else if (lang !== 'hi') {
+          } else {
+            const preferred = lang === 'hi' ? 'nemotron-3.5' : 'hinglish-swift';
             const installed = await api.fetchWhisperModels().catch(() => ({ models: [] as string[] }));
-            if (installed.models.includes('hinglish-swift')) {
-              w_real = 'hinglish-swift';
-              w_batch = 'hinglish-swift';
+            if (installed.models.includes(preferred)) {
+              w_real = preferred;
+              w_batch = preferred;
+            } else {
+              downloadModel = preferred;
             }
           }
-          
+
           const submitBtn = form.querySelector('button');
           if (submitBtn) submitBtn.textContent = 'SAVING...';
-          
+
           try {
             await api.saveSettings({
               whisper_realtime: w_real,
@@ -237,6 +241,25 @@ async function bootstrap() {
               spoken_language: lang,
               first_run_completed: true
             });
+            if (downloadModel) {
+              // Switch to the model once its download finishes (progress: Settings → MODELS).
+              // shortcut: if the app is closed mid-download the switch is skipped; pick it in Settings.
+              const target = downloadModel;
+              const onDownload = (ev: Event) => {
+                const detail = (ev as CustomEvent).detail;
+                if (detail?.name !== target || detail.status === 'downloading') return;
+                window.removeEventListener('zola-model-download', onDownload);
+                if (detail.status === 'done') {
+                  api.saveSettings({ whisper_realtime: target, whisper_batch: target })
+                    .catch(err => console.error('Failed to switch to downloaded model', err));
+                }
+              };
+              window.addEventListener('zola-model-download', onDownload);
+              await api.manageModel('download', target).catch(err => {
+                window.removeEventListener('zola-model-download', onDownload);
+                console.error('Failed to start model download', err);
+              });
+            }
             modal.style.display = 'none';
           } catch (err) {
             console.error('Failed to save first-run settings', err);

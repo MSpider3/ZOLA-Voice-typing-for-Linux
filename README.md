@@ -100,7 +100,13 @@ The Tauri frontend communicates with the backend via two channels:
 
 ---
 
-## One-Line System Installation
+## Installation
+
+**Fedora / openSUSE (.rpm) or Ubuntu / Debian (.deb):** download the package from the [latest release](https://github.com/MSpider3/ZOLA-Voice-typing-for-Linux/releases/latest) and install it (`sudo dnf install ./zola-*.rpm` or `sudo apt install ./zola_*.deb`). The package contains both the app and its speech daemon, plus the `/dev/uinput` access rule; log out and back in once, then open Zola — it starts the daemon itself (its log: `~/.local/state/zola/daemon.log`).
+
+The `.AppImage` also contains the daemon and works the same way. To have the daemon start at login (so the dictation hotkey works without opening the window), use the one-line installer below instead.
+
+## One-Line System Installation (AppImage + systemd)
 
 Setting up Zola on Fedora, Arch, or Ubuntu requires only a single terminal command. This script downloads pre-compiled assets from GitHub, configures systemd, and registers uinput permissions.
 

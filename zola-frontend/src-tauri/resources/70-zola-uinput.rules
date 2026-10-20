@@ -1,0 +1,3 @@
+# ZOLA types transcribed text through a virtual keyboard (/dev/uinput).
+# Give the logged-in desktop user access to it (applied at next login).
+KERNEL=="uinput", TAG+="uaccess", OPTIONS+="static_node=uinput"

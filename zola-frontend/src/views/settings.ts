@@ -542,7 +542,7 @@ const view: ViewModule = {
                 </div>
               </div>
               <div class="select-container">
-                <label class="select-label" for="restore_clipboard">RESTORE_CLIPBOARD_AFTER_PASTE (restore_clipboard)</label>
+                <label class="select-label" for="restore_clipboard">RESTORE_CLIPBOARD_AFTER_PASTE (restore_clipboard, text only)</label>
                 <div class="crt-select-wrap">
                   <select id="restore_clipboard" class="crt-select">
                     <option value="true">ON</option>

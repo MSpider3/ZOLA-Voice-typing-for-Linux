@@ -28,7 +28,7 @@ jobs:
       - name: Install Linux System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpkgconf-dev libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm libfuse2t64 jq
+          sudo apt-get install -y libpkgconf-dev libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm libfuse2t64 jq libportaudio2
 
       # --- STEP 2: BUILD PYTHON DAEMON BINARY ---
       - name: Setup Python
@@ -55,6 +55,9 @@ jobs:
           pip-audit -r requirements.lock
           bandit -r . -x .venv,profile_backend.py -q
           pyflakes *.py
+          # Regression suite (config, API security, history, model downloads);
+          # the other tests/ scripts need a live daemon, a mic or model downloads
+          (cd .. && python -m unittest tests.test_regressions)
           pyinstaller zola-daemon.spec
           test -f dist/zola-daemon
           chmod +x dist/zola-daemon
@@ -73,7 +76,15 @@ jobs:
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml || true
           npm install
 
-      - name: Build Tauri Frontend AppImage
+      # The rpm, deb and AppImage ship the daemon as a Tauri sidecar
+      # (bundle.externalBin), which Tauri expects under its target triple.
+      - name: Bundle the Daemon into the App
+        run: |
+          TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p zola-frontend/src-tauri/binaries
+          cp zola-backend/dist/zola-daemon "zola-frontend/src-tauri/binaries/zola-daemon-$TRIPLE"
+
+      - name: Build Tauri App Bundles (frontend + daemon)
         uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,7 +92,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Zola Release ${{ github.ref_name }}"
-          releaseBody: "Automated production build of Zola Voice Terminal and Daemon Core."
+          releaseBody: "Automated production build of Zola. The .rpm, .deb and .AppImage each contain the app and its speech daemon; the separate zola-daemon file is only used by install.sh (AppImage + systemd setup)."
           releaseDraft: false
           prerelease: false
           projectPath: "./zola-frontend"
@@ -104,6 +115,7 @@ jobs:
           echo "=== Generated Checksums ==="
           cat checksums.txt
 
+      # Standalone daemon for install.sh, which runs it as a systemd user service
       - name: Upload Compiled Daemon Binary and Checksums
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.3.0
         with:

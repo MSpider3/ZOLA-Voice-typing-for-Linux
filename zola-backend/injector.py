@@ -146,7 +146,7 @@ class KeystrokeInjector:
     (works for ALL Unicode, including Devanagari Hindi) and falls back to
     uinput character-by-character only for pure ASCII text when paste fails.
 
-    type_text() and erase_chars() are synchronous and must be run in a
+    type_text() is synchronous and must be run in a
     ThreadPoolExecutor. They contain time.sleep() calls for compositor stability.
 
     copy_to_clipboard() and inject_text() are async (use asyncio subprocess).
@@ -379,22 +379,6 @@ class KeystrokeInjector:
                 "KeystrokeInjector.type_text: %d character(s) skipped (not in keymap): %s",
                 len(skipped), ", ".join(skipped[:10]),
             )
-
-    def erase_chars(self, count: int, delay_ms: int = 8) -> None:
-        """Emit `count` KEY_BACKSPACE events to erase previously typed text."""
-        if count <= 0:
-            return
-
-        delay_s = delay_ms / 1000.0
-        try:
-            for _ in range(count):
-                self._ui.write(ecodes.EV_KEY, ecodes.KEY_BACKSPACE, 1)
-                self._ui.write(ecodes.EV_KEY, ecodes.KEY_BACKSPACE, 0)
-                self._ui.syn()
-                time.sleep(delay_s)
-        except Exception as exc:
-            logger.error("KeystrokeInjector.erase_chars: error emitting backspace: %s", exc)
-            self.release_all()
 
     # ----------------------------------------------------------------------- #
     # Clipboard-only copy (for session-end clipboard update, not injection)

@@ -30,6 +30,7 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper.vad import get_vad_model
 from scipy.io import wavfile
+from scipy.signal import resample_poly
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,10 @@ class AudioRecorder:
         # Peak level of the latest mic block (0..1), for the UI level meter
         self.level = 0.0
 
+        # Rate the mic is opened at; differs from sample_rate for mics that
+        # only accept 44.1/48 kHz (blocks are then converted in the callback)
+        self._capture_rate = sample_rate
+
         logger.info(
             "AudioRecorder: ready (mic opens only during recording, "
             "rate=%dHz, max_duration=%.0fs)",
@@ -85,7 +90,11 @@ class AudioRecorder:
         if status:
             logger.warning("AudioRecorder callback: %s", status)
         if self._is_recording:
-            self._queue.put_nowait(indata.copy())
+            if self._capture_rate != self.sample_rate:
+                block = resample_poly(indata, self.sample_rate, self._capture_rate, axis=0).astype(np.float32)
+            else:
+                block = indata.copy()
+            self._queue.put_nowait(block)
             self.level = float(np.abs(indata).max())
 
     # ----------------------------------------------------------------------- #
@@ -114,11 +123,21 @@ class AudioRecorder:
             self._buffer.clear()
 
         try:
+            # Many mics only accept 44.1/48 kHz: record at their own rate then
+            # and convert each 100 ms block to 16 kHz (still 1600 samples).
+            self._capture_rate = self.sample_rate
+            try:
+                sd.check_input_settings(device=device, samplerate=self.sample_rate,
+                                        channels=self.channels, dtype=self.dtype)
+            except Exception:
+                self._capture_rate = int(sd.query_devices(device, "input")["default_samplerate"])
+                logger.info("AudioRecorder: mic does not accept %d Hz — recording at %d Hz and converting",
+                            self.sample_rate, self._capture_rate)
             self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
+                samplerate=self._capture_rate,
                 channels=self.channels,
                 dtype=self.dtype,
-                blocksize=int(self.sample_rate * 0.1),  # 100ms blocks
+                blocksize=int(self._capture_rate * 0.1),  # 100ms blocks
                 callback=self._audio_callback,
                 device=device,
             )
@@ -340,8 +359,10 @@ class AudioRecorder:
                     yield utterance
 
         except asyncio.CancelledError:
+            # Cancelled (POST /cancel, shutdown): discard, never yield the rest
             logger.debug("AudioRecorder: stream_utterances cancelled")
             self._is_recording = False
+            raise
 
         # Yield any remaining partial utterance
         if (utterance_buf and utterance_samples >= int(self.sample_rate * 0.3)
@@ -443,7 +464,9 @@ class AudioRecorder:
                     silence_since = None
 
         except asyncio.CancelledError:
+            # Re-raise so the batch pipeline discards the recording (POST /cancel)
             self._is_recording = False
+            raise
 
         logger.debug("AudioRecorder: monitor_until_silence exited")
 

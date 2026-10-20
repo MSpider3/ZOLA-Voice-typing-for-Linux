@@ -29,6 +29,10 @@ All notable changes to the Zola Voice Typing project will be documented in this 
 - **Model downloads are pinned**: Hinglish Swift to a fixed repository commit, Nemotron to the release archive's SHA-256.
 - **The app does not start a second daemon** while one is still loading at login; the bundled daemon logs to `~/.local/state/zola/daemon.log`.
 - **CI runs the regression tests** before building a release.
+- **Hotkey did nothing on Fedora ("Invalid sample rate")**: the packaged daemon carried the build machine's PortAudio/ALSA libraries, which cannot load the desktop's PipeWire ALSA plugin, so the default microphone failed to open. The daemon now uses the system's PortAudio (the rpm/deb depend on it), and microphones that only accept 44.1/48 kHz are recorded at their own rate and converted to 16 kHz.
+- **`POST /cancel` typed the cancelled recording**: the recorder swallowed the cancellation, so batch mode transcribed and pasted it anyway, and realtime mode pasted its last utterance. Cancelling now discards the recording.
+- **Stopping the daemon hung while the app was open** (logout, `systemctl --user stop`): the app's event stream never closes, and the server waited for it forever. Shutdown now gives connections 3 s.
+- The settings field for the shortcut is labelled as a note; the hotkey itself is set in the desktop's shortcut settings.
 - **"CONFIG_LOAD_FAILURE: Load failed" right after install**: the daemon loaded (and on first start downloaded) its models before opening its port, so the app could not reach it for minutes. Models now load in the background: the app connects at once, shows "LOADING MODELS", and the settings page reloads when the daemon answers. Every `state_change` event now carries the full status (model names were missing during recording).
 - Removed unused code: the template `greet` command, the opener plugin, `erase_chars()`, and the installer's stale Nemotron option.
 

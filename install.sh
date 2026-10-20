@@ -98,6 +98,12 @@ chmod +x "$BIN_DIR/zola-daemon"
 chmod +x "$BIN_DIR/Zola.AppImage"
 
 # 4. Configure uinput permissions
+# The daemon records through the system's PortAudio (so it reaches PipeWire/PulseAudio)
+if ! ldconfig -p 2>/dev/null | grep -q "libportaudio.so.2"; then
+    log_warn "PortAudio is not installed; Zola cannot record until it is:"
+    log_warn "  Fedora: sudo dnf install portaudio   Ubuntu/Debian: sudo apt install libportaudio2   Arch: sudo pacman -S portaudio"
+fi
+
 log_info "Verifying kernel uinput device permissions..."
 UDEV_RULE_PATH="/etc/udev/rules.d/99-uinput.rules"
 NEEDS_RELOG=false

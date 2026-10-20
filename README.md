@@ -154,7 +154,7 @@ Zola runs local CTranslate2 `faster-whisper` models, plus extra model folders in
 ## Requirements
 
 - **OS:** Linux (Wayland / X11)
-- **Audio:** PipeWire or PulseAudio
+- **Audio:** PipeWire or PulseAudio, and PortAudio (`portaudio` / `libportaudio2`; the .rpm/.deb install it automatically)
 - **Dependencies (Backend):** Python 3.11+, `faster-whisper`, `sounddevice`, `evdev` (for `uinput` virtual keystrokes)
 - **Dependencies (Frontend):** Tauri, WebKit2GTK
 

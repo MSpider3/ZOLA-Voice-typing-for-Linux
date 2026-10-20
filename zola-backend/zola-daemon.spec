@@ -16,6 +16,12 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Use the desktop's own PortAudio/ALSA (the rpm/deb depend on PortAudio). Copies
+# from the build machine (Ubuntu) cannot load the system's ALSA plugins, e.g.
+# PipeWire's on Fedora, so the default microphone fell back to a raw device and
+# failed with "Invalid sample rate".
+a.binaries = [b for b in a.binaries if not b[0].startswith(('libportaudio', 'libasound.so', 'libjack'))]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

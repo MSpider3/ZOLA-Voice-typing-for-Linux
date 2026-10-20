@@ -11,6 +11,8 @@ import os
 import sys
 import tempfile
 import time
+
+import numpy as np
 import unittest
 from pathlib import Path
 
@@ -22,7 +24,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 
 class _TempConfig(unittest.TestCase):
-    """Point config.py at a throwaway directory instead of ~/.config/zola."""
+    """Point config.py (and recording temp files) at a throwaway directory."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -30,9 +32,17 @@ class _TempConfig(unittest.TestCase):
         config.CONFIG_DIR = Path(self._tmp.name)
         config.CONFIG_PATH = config.CONFIG_DIR / "settings.json"
         config._LEGACY_CONFIG_PATH = config.CONFIG_DIR / "no-legacy.json"
+        # state.make_audio_tmp_path() would otherwise create files in the real
+        # $XDG_RUNTIME_DIR/zola
+        self._saved_runtime = os.environ.get("XDG_RUNTIME_DIR")
+        os.environ["XDG_RUNTIME_DIR"] = self._tmp.name
 
     def tearDown(self) -> None:
         config.CONFIG_DIR, config.CONFIG_PATH, config._LEGACY_CONFIG_PATH = self._saved
+        if self._saved_runtime is None:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+        else:
+            os.environ["XDG_RUNTIME_DIR"] = self._saved_runtime
         self._tmp.cleanup()
 
 
@@ -343,6 +353,37 @@ class ModelStoreTests(unittest.TestCase):
         zapp.app.state.config.whisper_batch = "small"
         self.assertEqual(client.post("/models/delete", json={"name": "hinglish-swift"}).status_code, 200)
         self.assertFalse(self.store.is_installed("hinglish-swift"))
+
+
+class RecorderCancelTests(unittest.TestCase):
+    """POST /cancel cancels the pipeline task; the recorder must not swallow it,
+    or the batch pipeline transcribes and types the cancelled recording."""
+
+    def _cancel_while_running(self, start) -> None:
+        import recorder as R
+
+        async def scenario():
+            rec = R.AudioRecorder()
+            rec._is_recording = True
+            rec._session_start = time.monotonic()
+            for _ in range(5):  # some audio, so a swallowed cancel would have something to yield
+                rec._queue.put_nowait(np.full((1600, 1), 0.3, dtype=np.float32))
+            task = asyncio.create_task(start(rec))
+            await asyncio.sleep(0.3)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+
+    def test_batch_monitor_propagates_cancel(self) -> None:
+        self._cancel_while_running(lambda rec: rec.monitor_until_silence(silence_timeout_s=3.0))
+
+    def test_realtime_stream_propagates_cancel_without_yielding(self) -> None:
+        async def consume(rec):
+            async for _ in rec.stream_utterances(utterance_silence_s=0.7, force_commit_s=10.0):
+                self.fail("an utterance was yielded after cancel")
+        self._cancel_while_running(consume)
 
 
 if __name__ == "__main__":

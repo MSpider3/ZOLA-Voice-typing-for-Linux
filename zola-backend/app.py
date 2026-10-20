@@ -1018,4 +1018,7 @@ async def _realtime_loop(request: Request) -> None:
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=5001, log_level="info", reload=False)
+    # The UI's event stream never closes by itself; without a grace timeout,
+    # stopping the daemon (logout, systemctl stop) waits forever for it.
+    uvicorn.run(app, host="127.0.0.1", port=5001, log_level="info", reload=False,
+                timeout_graceful_shutdown=3)

@@ -8,6 +8,7 @@ export interface StatusData {
   ollama_model: string;
   whisper_realtime: string;
   whisper_batch: string;
+  models_ready: boolean; // false while the daemon loads/downloads its models
 }
 
 export interface HistoryEntry {

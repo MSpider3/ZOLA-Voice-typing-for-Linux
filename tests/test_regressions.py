@@ -119,7 +119,7 @@ class ApiTests(_TempConfig):
         zapp.app.state.app_state = zapp.AppState()
         zapp.app.state.recorder = _Recorder()
         zapp.app.state.llm = _LLM()
-        zapp.app.state.stt = None       # only touched when a model setting changes
+        zapp.app.state.stt = object()   # "models loaded"; only touched when a model setting changes
         zapp.app.state.injector = None  # only touched once a transcript exists
         zapp._last_trigger_time = 0.0
         # No context manager: the lifespan (models, uinput) is not run.
@@ -166,6 +166,15 @@ class ApiTests(_TempConfig):
     def test_foreign_host_header_is_rejected(self) -> None:
         r = self.client.get("/status", headers={"Host": "evil.example:5001"})
         self.assertEqual(r.status_code, 400)
+
+    def test_dictation_waits_for_models_to_load(self) -> None:
+        zapp.app.state.stt = None  # still loading (first start may download models)
+        self.assertFalse(self.client.get("/status").json()["models_ready"])
+        self.assertEqual(self.client.post("/trigger/batch").status_code, 503)
+        self.assertFalse(zapp.app.state.app_state.is_recording)
+        r = self.client.post("/settings", json={"whisper_batch": "base"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.client.post("/settings", json={"paste_method": "shift_insert"}).status_code, 200)
 
     def test_cancel_discards_recording(self) -> None:
         self.assertEqual(self.client.post("/cancel").json(), {"status": "idle"})

@@ -5,6 +5,7 @@ let containerElement: HTMLElement | null = null;
 let apiInstance: ZolaAPI | null = null;
 let downloadListener: ((e: Event) => void) | null = null;
 let lastCatalog: CatalogModel[] = [];
+let loadFailed = false; // retried when the daemon comes back (see updateState)
 
 function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -212,8 +213,10 @@ async function loadSettingsAndModels() {
 
     statusMsg.className = 'commit-status success';
     statusMsg.textContent = 'REGISTRIES_LOADED_OK';
+    loadFailed = false;
 
   } catch (err) {
+    loadFailed = true;
     console.error('Failed to load settings', err);
     statusMsg.className = 'commit-status error';
     statusMsg.textContent = `CONFIG_LOAD_FAILURE: ${err instanceof Error ? err.message : String(err)}`;
@@ -631,7 +634,13 @@ const view: ViewModule = {
     loadSettingsAndModels();
   },
 
-  updateState(_state: AppState) {},
+  // The page may open before the daemon answers (e.g. while it starts up)
+  updateState(state: AppState) {
+    if (loadFailed && state.connected) {
+      loadFailed = false;
+      loadSettingsAndModels();
+    }
+  },
 
   destroy() {
     if (downloadListener) {

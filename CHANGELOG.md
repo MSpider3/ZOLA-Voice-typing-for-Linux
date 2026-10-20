@@ -29,6 +29,7 @@ All notable changes to the Zola Voice Typing project will be documented in this 
 - **Model downloads are pinned**: Hinglish Swift to a fixed repository commit, Nemotron to the release archive's SHA-256.
 - **The app does not start a second daemon** while one is still loading at login; the bundled daemon logs to `~/.local/state/zola/daemon.log`.
 - **CI runs the regression tests** before building a release.
+- **"CONFIG_LOAD_FAILURE: Load failed" right after install**: the daemon loaded (and on first start downloaded) its models before opening its port, so the app could not reach it for minutes. Models now load in the background: the app connects at once, shows "LOADING MODELS", and the settings page reloads when the daemon answers. Every `state_change` event now carries the full status (model names were missing during recording).
 - Removed unused code: the template `greet` command, the opener plugin, `erase_chars()`, and the installer's stale Nemotron option.
 
 ## [1.2.0] - 2026-10-02

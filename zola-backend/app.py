@@ -124,12 +124,18 @@ async def lifespan(app: FastAPI):
         logger.critical("Failed to initialise AudioRecorder: %s", exc)
         raise
 
-    try:
-        stt = WhisperEngine(cfg)
-        app.state.stt = stt
-    except Exception as exc:
-        logger.critical("Failed to initialise WhisperEngine: %s", exc)
-        raise
+    # Models load in the background so the API (and the app's settings page)
+    # answers at once; the first start may download models for minutes.
+    app.state.stt = None
+
+    async def load_models() -> None:
+        try:
+            app.state.stt = await loop.run_in_executor(None, WhisperEngine, cfg)
+            broadcast_event("state_change", _status(app))
+        except Exception as exc:
+            logger.critical("Failed to initialise WhisperEngine: %s", exc)
+
+    models_task = asyncio.create_task(load_models(), name="load-models")
 
     llm = OllamaClient(cfg)
     app.state.llm = llm
@@ -166,6 +172,7 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("Zola daemon shutting down…")
         level_task.cancel()
+        models_task.cancel()
 
         if hasattr(app.state, "app_state"):
             try:
@@ -279,6 +286,16 @@ def _state(request: Request) -> AppState:
 def _cfg(request: Request) -> Config:
     return request.app.state.config
 
+
+def _status(app: FastAPI) -> dict[str, Any]:
+    """The full status the UI expects in /status and every state_change event."""
+    status = app.state.app_state.get_status()
+    status["ollama_model"] = app.state.llm.model_name
+    status["whisper_realtime"] = app.state.config.whisper_realtime
+    status["whisper_batch"] = app.state.config.whisper_batch
+    status["models_ready"] = app.state.stt is not None
+    return status
+
 def _check_rate_limit() -> None:
     """Raise HTTP 429 if called more than once per 500ms."""
     global _last_trigger_time
@@ -294,6 +311,13 @@ def _check_rate_limit() -> None:
 async def _open_mic(request: Request, audio_path: Path) -> None:
     """Start the recorder; if the mic cannot be opened, undo the recording state."""
     cfg = _cfg(request)
+    if request.app.state.stt is None:
+        await _state(request).stop_recording()
+        audio_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Speech models are still loading (the first start downloads them). Try again shortly.",
+        )
     if cfg.audio_feedback:
         # Played before the mic opens, so the tone is not recorded
         await asyncio.get_event_loop().run_in_executor(None, play_cue, "start")
@@ -302,7 +326,7 @@ async def _open_mic(request: Request, audio_path: Path) -> None:
     except Exception as exc:
         await _state(request).stop_recording()
         audio_path.unlink(missing_ok=True)
-        broadcast_event("state_change", _state(request).get_status())
+        broadcast_event("state_change", _status(request.app))
         raise HTTPException(status_code=503, detail=f"Could not open microphone: {exc}")
 
 
@@ -376,7 +400,7 @@ async def trigger_realtime(request: Request) -> JSONResponse:
 
     audio_path = await app_state.start_recording(RecordingMode.REALTIME)
     await _open_mic(request, audio_path)
-    broadcast_event("state_change", app_state.get_status())
+    broadcast_event("state_change", _status(request.app))
 
     task = asyncio.create_task(_realtime_loop(request), name="realtime-stt-loop")
     await app_state.set_realtime_task(task)
@@ -400,7 +424,7 @@ async def trigger_realtime_llm(request: Request) -> JSONResponse:
 
     audio_path = await app_state.start_recording(RecordingMode.REALTIME_LLM)
     await _open_mic(request, audio_path)
-    broadcast_event("state_change", app_state.get_status())
+    broadcast_event("state_change", _status(request.app))
 
     task = asyncio.create_task(_realtime_loop(request), name="realtime-llm-stt-loop")
     await app_state.set_realtime_task(task)
@@ -424,7 +448,7 @@ async def trigger_batch(request: Request) -> JSONResponse:
 
     audio_path = await app_state.start_recording(RecordingMode.BATCH)
     await _open_mic(request, audio_path)
-    broadcast_event("state_change", app_state.get_status())
+    broadcast_event("state_change", _status(request.app))
 
     task = asyncio.create_task(
         _batch_pipeline_loop(request, RecordingMode.BATCH), name="batch-pipeline"
@@ -450,7 +474,7 @@ async def trigger_batch_llm(request: Request) -> JSONResponse:
 
     audio_path = await app_state.start_recording(RecordingMode.BATCH_LLM)
     await _open_mic(request, audio_path)
-    broadcast_event("state_change", app_state.get_status())
+    broadcast_event("state_change", _status(request.app))
 
     task = asyncio.create_task(
         _batch_pipeline_loop(request, RecordingMode.BATCH_LLM), name="batch-llm-pipeline"
@@ -498,7 +522,7 @@ async def trigger_batch_translate(request: Request) -> JSONResponse:
 
     audio_path = await app_state.start_recording(RecordingMode.BATCH_TRANSLATE)
     await _open_mic(request, audio_path)
-    broadcast_event("state_change", app_state.get_status())
+    broadcast_event("state_change", _status(request.app))
 
     task = asyncio.create_task(
         _batch_pipeline_loop(request, RecordingMode.BATCH_TRANSLATE),
@@ -518,11 +542,7 @@ async def trigger_batch_translate(request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 @app.get("/status", summary="Daemon health and recording state")
 async def get_status(request: Request) -> JSONResponse:
-    status = _state(request).get_status()
-    status["ollama_model"] = request.app.state.llm.model_name
-    status["whisper_realtime"] = request.app.state.config.whisper_realtime
-    status["whisper_batch"] = request.app.state.config.whisper_batch
-    return JSONResponse(status)
+    return JSONResponse(_status(request.app))
 
 
 @app.post("/cancel", summary="Stop recording and discard it (nothing is typed)")
@@ -560,11 +580,7 @@ async def sse_events(request: Request) -> StreamingResponse:
 
     async def event_generator():
         try:
-            status = _state(request).get_status()
-            status["ollama_model"] = request.app.state.llm.model_name
-            status["whisper_realtime"] = request.app.state.config.whisper_realtime
-            status["whisper_batch"] = request.app.state.config.whisper_batch
-            yield f"event: state_change\ndata: {json.dumps(status)}\n\n"
+            yield f"event: state_change\ndata: {json.dumps(_status(request.app))}\n\n"
 
             while True:
                 if await request.is_disconnected():
@@ -601,6 +617,11 @@ async def post_settings(request: Request) -> JSONResponse:
     stt: WhisperEngine = request.app.state.stt
     engine_keys = ("whisper_realtime", "whisper_batch", "cpu_threads", "compute_type")
     previous = {k: getattr(cfg, k) for k in engine_keys}
+    if stt is None and any(body.get(k, previous[k]) != previous[k] for k in engine_keys):
+        raise HTTPException(
+            status_code=409,
+            detail="Speech models are still loading — change the model once they are ready.",
+        )
 
     try:
         changed_keys = update_config(cfg, body)
@@ -647,11 +668,7 @@ async def post_settings(request: Request) -> JSONResponse:
     if "max_record_duration_s" in changed_keys:
         request.app.state.recorder._max_duration_s = cfg.max_record_duration_s
 
-    status = _state(request).get_status()
-    status["ollama_model"] = request.app.state.llm.model_name
-    status["whisper_realtime"] = request.app.state.config.whisper_realtime
-    status["whisper_batch"] = request.app.state.config.whisper_batch
-    broadcast_event("state_change", status)
+    broadcast_event("state_change", _status(request.app))
 
     return JSONResponse({
         "status": "ok",
@@ -800,7 +817,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
         _stop_cue(cfg)
         await app_state.stop_recording()
         stopped = True
-        broadcast_event("state_change", app_state.get_status())
+        broadcast_event("state_change", _status(request.app))
 
         if duration_s < 0.3:
             logger.warning("Batch pipeline: recording too short (%.2fs) — skipping", duration_s)
@@ -855,7 +872,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
             audio_path, _ = recorder.stop()
             try:
                 await app_state.stop_recording()
-                broadcast_event("state_change", app_state.get_status())
+                broadcast_event("state_change", _status(request.app))
             except Exception as b_err:
                 logger.debug("Broadcast cancellation state change ignored: %s", b_err)
     except Exception as exc:
@@ -864,7 +881,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
             audio_path, _ = recorder.stop()
             try:
                 await app_state.stop_recording()
-                broadcast_event("state_change", app_state.get_status())
+                broadcast_event("state_change", _status(request.app))
             except Exception as b_err:
                 logger.debug("Broadcast error state change ignored: %s", b_err)
     finally:
@@ -950,7 +967,7 @@ async def _realtime_loop(request: Request) -> None:
 
         try:
             await app_state.stop_recording()
-            broadcast_event("state_change", app_state.get_status())
+            broadcast_event("state_change", _status(request.app))
         except Exception as b_err:
             logger.debug("Broadcast final state change ignored: %s", b_err)
 

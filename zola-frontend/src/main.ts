@@ -13,6 +13,7 @@ export interface AppState {
   ollamaModel: string;
   whisperRealtime: string;
   whisperBatch: string;
+  modelsReady: boolean;
 }
 
 // Global state instance
@@ -26,7 +27,8 @@ export const state: AppState = {
   micLevel: 0,
   ollamaModel: '',
   whisperRealtime: 'base',
-  whisperBatch: 'small'
+  whisperBatch: 'small',
+  modelsReady: true
 };
 
 // API Instance
@@ -108,7 +110,7 @@ function updateConnectionUI(status: 'ONLINE' | 'OFFLINE' | 'RECONNECTING') {
       connectionIndicator.classList.add('recording');
       daemonStatusText.textContent = `RECORDING // ${state.activeMode?.toUpperCase()}`;
     } else {
-      daemonStatusText.textContent = 'STANDBY';
+      daemonStatusText.textContent = state.modelsReady ? 'STANDBY' : 'LOADING MODELS';
     }
   } else if (status === 'OFFLINE') {
     connectionIndicator.classList.add('offline');
@@ -129,6 +131,7 @@ function handleSSEEvent(event: any) {
     state.ollamaModel = statusData.ollama_model;
     state.whisperRealtime = statusData.whisper_realtime;
     state.whisperBatch = statusData.whisper_batch;
+    state.modelsReady = statusData.models_ready;
     if (!state.isRecording) state.micLevel = 0;
 
     updateConnectionUI(state.connected ? 'ONLINE' : 'OFFLINE');
@@ -188,6 +191,7 @@ async function bootstrap() {
     state.ollamaModel = initStatus.ollama_model;
     state.whisperRealtime = initStatus.whisper_realtime;
     state.whisperBatch = initStatus.whisper_batch;
+    state.modelsReady = initStatus.models_ready;
     updateConnectionUI('ONLINE');
   } catch (err) {
     updateConnectionUI('OFFLINE');

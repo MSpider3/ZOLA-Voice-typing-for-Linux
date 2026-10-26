@@ -29,8 +29,11 @@ import time
 from typing import NamedTuple
 
 import httpx
+from pathlib import Path
 
 BASE_URL = "http://127.0.0.1:5001"
+# The daemon requires its API token (created on first start)
+AUTH = {"Authorization": "Bearer " + (Path.home() / ".config" / "zola" / "token").read_text().strip()}
 TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 
 RESET  = "\033[0m"
@@ -301,7 +304,7 @@ async def main():
 
     # Verify daemon is up before starting
     try:
-        async with httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT) as probe:
+        async with httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT, headers=AUTH) as probe:
             r = await probe.get("/status")
             if r.status_code != 200:
                 print(f"{RED}ERROR: Daemon returned HTTP {r.status_code}. Is it running?{RESET}")
@@ -316,7 +319,7 @@ async def main():
 
     results: list[TestResult] = []
 
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT) as client:
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT, headers=AUTH) as client:
         print(f"{BOLD}Running Test 1/5: Status Hammer...{RESET}")
         results.append(await test_status_hammer(client))
 

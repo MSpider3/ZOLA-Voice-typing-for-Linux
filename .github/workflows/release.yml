@@ -102,6 +102,7 @@ jobs:
         run: |
           mkdir -p release-dist
           cp zola-backend/dist/zola-daemon release-dist/
+          cp zola-frontend/src-tauri/resources/zola-trigger release-dist/
           
           # Find and copy all built Tauri bundles (AppImage, deb, rpm)
           find zola-frontend/src-tauri/target/release/bundle -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release-dist/ \;
@@ -121,6 +122,7 @@ jobs:
         with:
           files: |
             release-dist/zola-daemon
+            release-dist/zola-trigger
             release-dist/checksums.txt
           tag_name: ${{ github.ref_name }}
         env:

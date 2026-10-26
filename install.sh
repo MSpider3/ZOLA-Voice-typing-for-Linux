@@ -59,43 +59,39 @@ mkdir -p "$APP_DIR"
 systemctl --user stop zola-backend.service 2>/dev/null || true
 
 # 1. Download pre-compiled assets
-log_info "Downloading standalone backend daemon binary..."
-curl --fail --show-error -L -o "$BIN_DIR/zola-daemon" "https://github.com/$REPO/releases/download/$LATEST_RELEASE/zola-daemon"
-
-log_info "Downloading Tauri frontend AppImage..."
 VERSION_NO="${LATEST_RELEASE#v}"
-curl --fail --show-error -L -o "$BIN_DIR/Zola.AppImage" "https://github.com/$REPO/releases/download/$LATEST_RELEASE/zola_${VERSION_NO}_amd64.AppImage"
+APPIMAGE_NAME="zola_${VERSION_NO}_amd64.AppImage"
+RELEASE_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE"
 
+log_info "Downloading standalone backend daemon binary..."
+curl --fail --show-error -L -o "$BIN_DIR/zola-daemon" "$RELEASE_URL/zola-daemon"
+log_info "Downloading Tauri frontend AppImage..."
+curl --fail --show-error -L -o "$BIN_DIR/Zola.AppImage" "$RELEASE_URL/$APPIMAGE_NAME"
+log_info "Downloading the zola-trigger hotkey helper..."
+curl --fail --show-error -L -o "$BIN_DIR/zola-trigger" "$RELEASE_URL/zola-trigger"
+
+# Every file must match the release's checksums.txt; a missing list or entry aborts.
 log_info "Verifying checksums..."
-CHECKSUMS_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/checksums.txt"
-if curl --output /dev/null --silent --head --fail "$CHECKSUMS_URL"; then
-    EXPECTED_DAEMON_HASH=$(curl --fail --show-error -sL "$CHECKSUMS_URL" | grep "zola-daemon" | cut -d' ' -f1)
-    ACTUAL_DAEMON_HASH=$(sha256sum "$BIN_DIR/zola-daemon" | cut -d' ' -f1)
-    
-    if [ -z "$EXPECTED_DAEMON_HASH" ] || [ "$EXPECTED_DAEMON_HASH" != "$ACTUAL_DAEMON_HASH" ]; then
-        log_error "Checksum mismatch for zola-daemon. Aborting."
-        rm -f "$BIN_DIR/zola-daemon"
-        exit 1
-    fi
-    
-    APPIMAGE_NAME="zola_${VERSION_NO}_amd64.AppImage"
-    EXPECTED_APP_HASH=$(curl --fail --show-error -sL "$CHECKSUMS_URL" | grep "$APPIMAGE_NAME" | cut -d' ' -f1)
-    ACTUAL_APP_HASH=$(sha256sum "$BIN_DIR/Zola.AppImage" | cut -d' ' -f1)
-    
-    if [ -z "$EXPECTED_APP_HASH" ] || [ "$EXPECTED_APP_HASH" != "$ACTUAL_APP_HASH" ]; then
-        log_error "Checksum mismatch for AppImage. Aborting."
-        rm -f "$BIN_DIR/Zola.AppImage"
-        exit 1
-    fi
-    log_info "Checksums verified successfully."
-else
-    log_warn "No checksums.txt found for release. Skipping verification."
+if ! CHECKSUMS=$(curl --fail --show-error -sL "$RELEASE_URL/checksums.txt"); then
+    log_error "Could not download checksums.txt for $LATEST_RELEASE. Aborting."
+    rm -f "$BIN_DIR/zola-daemon" "$BIN_DIR/Zola.AppImage" "$BIN_DIR/zola-trigger"
+    exit 1
 fi
+for pair in "zola-daemon:zola-daemon" "$APPIMAGE_NAME:Zola.AppImage" "zola-trigger:zola-trigger"; do
+    asset="${pair%%:*}"; file="$BIN_DIR/${pair#*:}"
+    expected=$(printf '%s\n' "$CHECKSUMS" | awk -v name="$asset" '$2 == name {print $1}')
+    actual=$(sha256sum "$file" | cut -d' ' -f1)
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        log_error "Checksum mismatch or missing for $asset. Aborting."
+        rm -f "$BIN_DIR/zola-daemon" "$BIN_DIR/Zola.AppImage" "$BIN_DIR/zola-trigger"
+        exit 1
+    fi
+done
+log_info "Checksums verified successfully."
 
 # 2. Set executable permissions
 log_info "Applying execution permissions to binaries..."
-chmod +x "$BIN_DIR/zola-daemon"
-chmod +x "$BIN_DIR/Zola.AppImage"
+chmod +x "$BIN_DIR/zola-daemon" "$BIN_DIR/Zola.AppImage" "$BIN_DIR/zola-trigger"
 
 # 4. Configure uinput permissions
 # The daemon records through the system's PortAudio (so it reaches PipeWire/PulseAudio)

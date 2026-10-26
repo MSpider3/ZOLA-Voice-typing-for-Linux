@@ -50,9 +50,9 @@ If you are developing locally or testing without pushing to GitHub, you can buil
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-3. Run the daemon locally:
+3. Run the daemon locally (`python app.py`, not `uvicorn app:app`: app.py turns off request logging, which would record the `/events?token=`, and sets the shutdown grace period):
    ```bash
-   uvicorn app:app --host 127.0.0.1 --port 5001
+   python app.py
    ```
 
 ### Frontend Local Setup
@@ -99,11 +99,13 @@ window-rule {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Keybinds: Map active trigger directly to background HTTP trigger
+// Keybinds: zola-trigger sends the trigger request with the API token
 // ─────────────────────────────────────────────────────────────────────────────
+spawn-at-startup "/usr/bin/zola-daemon"
+
 binds {
     // Super+V: Toggle configured Active Voice Typing mode
-    Mod+V { spawn "curl" "-s" "-X" "POST" "http://127.0.0.1:5001/trigger"; }
+    Mod+V { spawn "zola-trigger"; }
 }
 ```
 
@@ -112,11 +114,10 @@ binds {
 ## Troubleshooting
 
 ### stuck modifier keys
-If the daemon is killed during active typing injection, modifier keys (e.g. Shift) might remain pressed down at the kernel level. To release all keys instantly:
+If the daemon is killed during active typing injection, modifier keys (e.g. Shift) might remain pressed down at the kernel level. Removing the virtual keyboard releases them: stop and restart the daemon (a clean shutdown also runs its `release_all()` routine):
 ```bash
-curl -X POST http://127.0.0.1:5001/trigger
+pkill -x zola-daemon   # or: systemctl --user restart zola-backend
 ```
-This forces the backend state machine to run its `release_all()` routine.
 
 ### Clipboard Integration fails under systemd
 If `wl-copy` cannot write to the clipboard when running inside the background service, import the graphical environment variables into systemd:

@@ -12,29 +12,31 @@ Security notes:
     only hides the response; the request would still run).
   - ollama_url is validated to loopback-only in config.py.
   - Transcript content is never logged at INFO level (privacy).
-  - Trigger endpoints are rate-limited to 1 request per 500ms.
-  - /tmp is not used for audio — XDG_RUNTIME_DIR/zola/ is used instead.
+  - Every request needs the local API token (~/.config/zola/token).
+  - Starting a recording is rate-limited to 1 per 500ms.
+  - Audio stays in memory; nothing is written to disk.
 
-Start the server:
-  uvicorn app:app --host 127.0.0.1 --port 5001 --log-level info
+Start the server (not `uvicorn app:app`, which skips the settings in __main__):
+  python app.py
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from config import MODELS_DIR, Config, installed_models, load_config, update_config
+from config import MODELS_DIR, Config, installed_models, load_config, load_or_create_token, update_config
 from core_llm import OllamaClient
 import model_store
 from core_stt import WhisperEngine, _model_meta, apply_replacements
@@ -64,6 +66,13 @@ WHISPER_MODEL_SIZES = [
 
 # Whisper models that were not trained on the translate task
 _NO_TRANSLATE_MODELS = {"large-v3-turbo", "distil-large-v3"}
+
+# Local API token (config.load_or_create_token), set at startup
+_API_TOKEN: str | None = None
+
+# Model downloads take minutes; they get their own thread so the default
+# executor stays free for transcription and typing.
+_DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zola-download")
 
 # Rate limiting: minimum seconds between trigger requests
 _TRIGGER_COOLDOWN_S = 0.5
@@ -102,6 +111,8 @@ async def lifespan(app: FastAPI):
 
     cfg: Config = load_config()
     app.state.config = cfg
+    global _API_TOKEN
+    _API_TOKEN = load_or_create_token()
 
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zola-worker")
     app.state.executor = executor
@@ -220,13 +231,6 @@ app = FastAPI(
 # Previously allow_origins=["*"] — that allowed any browser page to control the daemon.
 _ALLOWED_ORIGINS = ["tauri://localhost", "http://localhost:1420"]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
-)
 
 
 class _OriginGuard:
@@ -250,6 +254,42 @@ class _OriginGuard:
         await self.app(scope, receive, send)
 
 
+class _TokenGuard:
+    """
+    Require the local API token on every request: `Authorization: Bearer <token>`,
+    or `?token=` on /events (the browser EventSource cannot send headers).
+    CORS preflights carry no credentials and are left to the CORS middleware.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope["method"] != "OPTIONS":
+            given = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            given = given.removeprefix("Bearer ").strip()
+            if not given and scope["path"] == "/events":
+                given = parse_qs(scope["query_string"].decode("latin-1")).get("token", [""])[0]
+            if not (_API_TOKEN and hmac.compare_digest(given, _API_TOKEN)):
+                response = JSONResponse(
+                    {"detail": "Missing or wrong API token (see ~/.config/zola/token)"},
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Order (outermost last): TrustedHost → Origin → CORS → token. CORS sits outside
+# the token check so a 401 still carries CORS headers and the UI can read it.
+app.add_middleware(_TokenGuard)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 app.add_middleware(_OriginGuard)
 # Host check defeats DNS-rebinding (a foreign hostname resolving to 127.0.0.1)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
@@ -308,12 +348,11 @@ def _check_rate_limit() -> None:
     _last_trigger_time = now
 
 
-async def _open_mic(request: Request, audio_path: Path) -> None:
+async def _open_mic(request: Request) -> None:
     """Start the recorder; if the mic cannot be opened, undo the recording state."""
     cfg = _cfg(request)
     if request.app.state.stt is None:
         await _state(request).stop_recording()
-        audio_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=503,
             detail="Speech models are still loading (the first start downloads them). Try again shortly.",
@@ -322,10 +361,9 @@ async def _open_mic(request: Request, audio_path: Path) -> None:
         # Played before the mic opens, so the tone is not recorded
         await asyncio.get_event_loop().run_in_executor(None, play_cue, "start")
     try:
-        request.app.state.recorder.start(audio_path, cfg.input_device)
+        request.app.state.recorder.start(cfg.input_device)
     except Exception as exc:
         await _state(request).stop_recording()
-        audio_path.unlink(missing_ok=True)
         broadcast_event("state_change", _status(request.app))
         raise HTTPException(status_code=503, detail=f"Could not open microphone: {exc}")
 
@@ -364,123 +402,68 @@ def _stop_cue(cfg: Config) -> None:
 # --------------------------------------------------------------------------- #
 # Trigger Routes
 # --------------------------------------------------------------------------- #
+async def _toggle_recording(request: Request, mode: RecordingMode) -> JSONResponse:
+    """
+    Start recording in `mode`, or stop it if that mode is already recording.
+    Shared by every trigger route. Only starting is rate-limited, so a quick
+    stop always works; a start that loses a race with another start gets 409.
+    """
+    app_state = _state(request)
+
+    if app_state.is_recording and app_state.active_mode == mode:
+        request.app.state.recorder.request_stop()
+        return JSONResponse({"status": "stopping", "mode": mode.value})
+
+    _check_rate_limit()
+    if app_state.is_recording:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Already recording in mode '{app_state.active_mode}'.",
+        )
+    try:
+        await app_state.start_recording(mode)
+    except RuntimeError as exc:  # another trigger started recording first
+        raise HTTPException(status_code=409, detail=str(exc))
+    await _open_mic(request)
+    broadcast_event("state_change", _status(request.app))
+
+    if mode in (RecordingMode.REALTIME, RecordingMode.REALTIME_LLM):
+        task = asyncio.create_task(_realtime_loop(request), name=f"{mode.value}-loop")
+    else:
+        task = asyncio.create_task(_batch_pipeline_loop(request, mode), name=f"{mode.value}-pipeline")
+    await app_state.set_realtime_task(task)
+    return JSONResponse({"status": "started", "mode": mode.value})
+
+
 @app.post("/trigger", summary="Toggle the configured active transcription mode")
 async def trigger_active_mode(request: Request) -> JSONResponse:
-    # Rate limiting is done by the mode handler this dispatches to.
-    cfg = _cfg(request)
-    mode = cfg.active_mode or "batch"
-    if mode == "realtime":
-        return await trigger_realtime(request)
-    elif mode == "realtime-llm":
-        return await trigger_realtime_llm(request)
-    elif mode == "batch":
-        return await trigger_batch(request)
-    elif mode == "batch-llm":
-        return await trigger_batch_llm(request)
-    elif mode == "batch-translate":
+    try:
+        mode = RecordingMode(_cfg(request).active_mode or "batch")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid active mode: {_cfg(request).active_mode}")
+    if mode == RecordingMode.BATCH_TRANSLATE:
         return await trigger_batch_translate(request)
-    else:
-        raise HTTPException(status_code=400, detail=f"Invalid active mode: {mode}")
+    return await _toggle_recording(request, mode)
 
 
 @app.post("/trigger/realtime", summary="Toggle real-time continuous transcription")
 async def trigger_realtime(request: Request) -> JSONResponse:
-    _check_rate_limit()
-    app_state = _state(request)
-
-    if app_state.is_recording and app_state.active_mode == RecordingMode.REALTIME:
-        request.app.state.recorder.request_stop()
-        return JSONResponse({"status": "stopping", "mode": "realtime"})
-
-    if app_state.is_recording:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Already recording in mode '{app_state.active_mode}'.",
-        )
-
-    audio_path = await app_state.start_recording(RecordingMode.REALTIME)
-    await _open_mic(request, audio_path)
-    broadcast_event("state_change", _status(request.app))
-
-    task = asyncio.create_task(_realtime_loop(request), name="realtime-stt-loop")
-    await app_state.set_realtime_task(task)
-    return JSONResponse({"status": "started", "mode": "realtime"})
+    return await _toggle_recording(request, RecordingMode.REALTIME)
 
 
 @app.post("/trigger/realtime-llm", summary="Toggle real-time transcription + LLM refinement")
 async def trigger_realtime_llm(request: Request) -> JSONResponse:
-    _check_rate_limit()
-    app_state = _state(request)
-
-    if app_state.is_recording and app_state.active_mode == RecordingMode.REALTIME_LLM:
-        request.app.state.recorder.request_stop()
-        return JSONResponse({"status": "stopping", "mode": "realtime-llm"})
-
-    if app_state.is_recording:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Already recording in mode '{app_state.active_mode}'.",
-        )
-
-    audio_path = await app_state.start_recording(RecordingMode.REALTIME_LLM)
-    await _open_mic(request, audio_path)
-    broadcast_event("state_change", _status(request.app))
-
-    task = asyncio.create_task(_realtime_loop(request), name="realtime-llm-stt-loop")
-    await app_state.set_realtime_task(task)
-    return JSONResponse({"status": "started", "mode": "realtime-llm"})
+    return await _toggle_recording(request, RecordingMode.REALTIME_LLM)
 
 
 @app.post("/trigger/batch", summary="Toggle batch transcription (full sentence)")
 async def trigger_batch(request: Request) -> JSONResponse:
-    _check_rate_limit()
-    app_state = _state(request)
-
-    if app_state.is_recording and app_state.active_mode == RecordingMode.BATCH:
-        request.app.state.recorder.request_stop()
-        return JSONResponse({"status": "stopping", "mode": "batch"})
-
-    if app_state.is_recording:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Already recording in mode '{app_state.active_mode}'.",
-        )
-
-    audio_path = await app_state.start_recording(RecordingMode.BATCH)
-    await _open_mic(request, audio_path)
-    broadcast_event("state_change", _status(request.app))
-
-    task = asyncio.create_task(
-        _batch_pipeline_loop(request, RecordingMode.BATCH), name="batch-pipeline"
-    )
-    await app_state.set_realtime_task(task)
-    return JSONResponse({"status": "started", "mode": "batch"})
+    return await _toggle_recording(request, RecordingMode.BATCH)
 
 
 @app.post("/trigger/batch-llm", summary="Toggle batch transcription + LLM formatting")
 async def trigger_batch_llm(request: Request) -> JSONResponse:
-    _check_rate_limit()
-    app_state = _state(request)
-
-    if app_state.is_recording and app_state.active_mode == RecordingMode.BATCH_LLM:
-        request.app.state.recorder.request_stop()
-        return JSONResponse({"status": "stopping", "mode": "batch-llm"})
-
-    if app_state.is_recording:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Already recording in mode '{app_state.active_mode}'.",
-        )
-
-    audio_path = await app_state.start_recording(RecordingMode.BATCH_LLM)
-    await _open_mic(request, audio_path)
-    broadcast_event("state_change", _status(request.app))
-
-    task = asyncio.create_task(
-        _batch_pipeline_loop(request, RecordingMode.BATCH_LLM), name="batch-llm-pipeline"
-    )
-    await app_state.set_realtime_task(task)
-    return JSONResponse({"status": "started", "mode": "batch-llm"})
+    return await _toggle_recording(request, RecordingMode.BATCH_LLM)
 
 
 @app.post(
@@ -495,13 +478,7 @@ async def trigger_batch_translate(request: Request) -> JSONResponse:
     ⚠️ EXPERIMENTAL: Whisper's native translation is unreliable for Hinglish
     code-switching — it frequently outputs Hindi script instead of English.
     For reliable Hindi→English, use /trigger/batch-llm with output_language=english.
-
-    No Ollama required — Whisper handles translation natively.
-    Uses the batch model (small by default).
     """
-    _check_rate_limit()
-    app_state = _state(request)
-
     if _cfg(request).whisper_batch in _NO_TRANSLATE_MODELS:
         logger.warning(
             "batch-translate: model '%s' cannot translate and will output the "
@@ -509,32 +486,15 @@ async def trigger_batch_translate(request: Request) -> JSONResponse:
             "output_language=english.",
             _cfg(request).whisper_batch,
         )
-
-    if app_state.is_recording and app_state.active_mode == RecordingMode.BATCH_TRANSLATE:
-        request.app.state.recorder.request_stop()
-        return JSONResponse({"status": "stopping", "mode": "batch-translate"})
-
-    if app_state.is_recording:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Already recording in mode '{app_state.active_mode}'.",
-        )
-
-    audio_path = await app_state.start_recording(RecordingMode.BATCH_TRANSLATE)
-    await _open_mic(request, audio_path)
-    broadcast_event("state_change", _status(request.app))
-
-    task = asyncio.create_task(
-        _batch_pipeline_loop(request, RecordingMode.BATCH_TRANSLATE),
-        name="batch-translate-pipeline",
-    )
-    await app_state.set_realtime_task(task)
-    return JSONResponse({
-        "status": "started",
-        "mode": "batch-translate",
-        "note": "Native Whisper translation is experimental on Hinglish. "
-                "For reliable Hindi→English, use batch-llm with output_language=english."
-    })
+    response = await _toggle_recording(request, RecordingMode.BATCH_TRANSLATE)
+    if json.loads(response.body)["status"] == "started":
+        return JSONResponse({
+            "status": "started",
+            "mode": "batch-translate",
+            "note": "Native Whisper translation is experimental on Hinglish. "
+                    "For reliable Hindi→English, use batch-llm with output_language=english.",
+        })
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -735,7 +695,7 @@ async def download_model(request: Request) -> JSONResponse:
 
     async def run() -> None:
         try:
-            await loop.run_in_executor(None, model_store.download, name, progress)
+            await loop.run_in_executor(_DOWNLOAD_EXECUTOR, model_store.download, name, progress)
             _model_meta.cache_clear()
             _download_event(app_, name, "done")
         except Exception as exc:
@@ -785,13 +745,11 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
 
     Flow:
       1. monitor_until_silence() — waits for silence or manual stop.
-      2. recorder.stop() — flushes WAV, closes mic.
+      2. recorder.stop() — closes mic, returns the audio (in memory only).
       3. Transcribe (or translate for batch-translate) in ThreadPoolExecutor.
       4. [batch-llm] Format via Ollama.
       5. inject_text() — clipboard paste primary, uinput fallback.
-      6. copy_to_clipboard() — session-end clipboard update.
-      7. Update state + history.
-      8. Clean up temp audio file.
+      6. Update state + history.
     """
     recorder: AudioRecorder = request.app.state.recorder
     stt: WhisperEngine = request.app.state.stt
@@ -804,7 +762,6 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
 
     logger.info("Batch pipeline started (mode=%s)", mode.value)
 
-    audio_path = None
     stopped = False  # once True, the recorder may already belong to a newer session
     try:
         await recorder.monitor_until_silence(
@@ -813,7 +770,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
             max_record_duration_s=cfg.max_record_duration_s,
         )
 
-        audio_path, duration_s = recorder.stop()
+        audio, duration_s = recorder.stop()
         _stop_cue(cfg)
         await app_state.stop_recording()
         stopped = True
@@ -826,7 +783,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
         # Transcribe or translate
         if mode == RecordingMode.BATCH_TRANSLATE:
             raw_transcript: str = await loop.run_in_executor(
-                None, stt.translate_file, audio_path
+                None, stt.translate_audio, audio
             )
             logger.info(
                 "Batch-translate: %d chars in %.1fs",
@@ -834,7 +791,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
             )
         else:
             raw_transcript = await loop.run_in_executor(
-                None, stt.transcribe_file, audio_path, "batch"
+                None, stt.transcribe_audio, audio, "batch"
             )
             logger.info(
                 "Batch transcription: %d chars in %.1fs",
@@ -869,7 +826,7 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
     except asyncio.CancelledError:
         logger.info("Batch pipeline cancelled")
         if not stopped:
-            audio_path, _ = recorder.stop()
+            recorder.stop()
             try:
                 await app_state.stop_recording()
                 broadcast_event("state_change", _status(request.app))
@@ -878,20 +835,12 @@ async def _batch_pipeline_loop(request: Request, mode: RecordingMode) -> None:
     except Exception as exc:
         logger.exception("Batch pipeline error: %s", exc)
         if not stopped:
-            audio_path, _ = recorder.stop()
+            recorder.stop()
             try:
                 await app_state.stop_recording()
                 broadcast_event("state_change", _status(request.app))
             except Exception as b_err:
                 logger.debug("Broadcast error state change ignored: %s", b_err)
-    finally:
-        # Clean up the per-session temp audio file
-        if audio_path and Path(audio_path).exists():
-            try:
-                Path(audio_path).unlink()
-                logger.debug("Cleaned up temp audio file: %s", audio_path)
-            except Exception as exc:
-                logger.warning("Could not delete temp audio: %s: %s", audio_path, exc)
 
 
 async def _realtime_loop(request: Request) -> None:
@@ -961,7 +910,6 @@ async def _realtime_loop(request: Request) -> None:
     except Exception as exc:
         logger.exception("Realtime loop error: %s", exc)
     finally:
-        audio_path_str = app_state.current_audio_path
         recorder.stop()
         _stop_cue(cfg)
 
@@ -1004,13 +952,6 @@ async def _realtime_loop(request: Request) -> None:
             duration_s, len(session_transcript), len(full_text),
         )
 
-        # Clean up per-session temp audio file
-        if audio_path_str and Path(audio_path_str).exists():
-            try:
-                Path(audio_path_str).unlink()
-                logger.debug("Cleaned up temp audio file: %s", audio_path_str)
-            except Exception as exc:
-                logger.warning("Could not delete temp audio: %s: %s", audio_path_str, exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1020,5 +961,6 @@ if __name__ == "__main__":
     import uvicorn
     # The UI's event stream never closes by itself; without a grace timeout,
     # stopping the daemon (logout, systemctl stop) waits forever for it.
+    # access_log=False: request lines would put the /events ?token= in the log
     uvicorn.run(app, host="127.0.0.1", port=5001, log_level="info", reload=False,
-                timeout_graceful_shutdown=3)
+                timeout_graceful_shutdown=3, access_log=False)

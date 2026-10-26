@@ -15,15 +15,38 @@ fn daemon_process_running() -> bool {
     })
 }
 
+/// `$XDG_<kind>_HOME/zola`, falling back to `~/<fallback>/zola`.
+fn zola_dir(kind: &str, fallback: &str) -> Option<PathBuf> {
+    std::env::var_os(format!("XDG_{kind}_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback)))
+        .map(|dir| dir.join("zola"))
+}
+
 /// Daemon output goes to $XDG_STATE_HOME/zola/daemon.log (~/.local/state/zola),
 /// so startup errors are visible when the app was launched from the desktop.
+/// The log starts afresh once it passes 5 MB.
 fn daemon_log() -> Option<fs::File> {
-    let dir = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?
-        .join("zola");
+    let dir = zola_dir("STATE", ".local/state")?;
     fs::create_dir_all(&dir).ok()?;
-    OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).ok()
+    let path = dir.join("daemon.log");
+    let too_big = fs::metadata(&path).map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false);
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(!too_big)
+        .truncate(too_big)
+        .open(path)
+        .ok()
+}
+
+/// The daemon's local API token (~/.config/zola/token), for the UI's requests.
+#[tauri::command]
+fn api_token() -> Result<String, String> {
+    let path = zola_dir("CONFIG", ".config").ok_or("no home directory")?.join("token");
+    fs::read_to_string(&path)
+        .map(|token| token.trim().to_string())
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Start the backend daemon bundled next to this executable (Tauri sidecar,
@@ -71,6 +94,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![api_token])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

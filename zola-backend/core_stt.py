@@ -28,14 +28,13 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
-from typing import Union
 
 from types import SimpleNamespace
 
 import numpy as np
-from scipy.io import wavfile
 from faster_whisper import WhisperModel
 from faster_whisper.vad import VadOptions
 
@@ -79,10 +78,14 @@ class WhisperEngine:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._lock = asyncio.Lock()
+        # Cleared while hot_reload() swaps a model: a transcription that starts
+        # meanwhile waits for the new model instead of finding an empty slot.
+        self._models_ready = threading.Event()
+        self._models_ready.set()
 
         logger.info(
             "WhisperEngine: loading models — realtime='%s', batch='%s' "
-            "(compute='%s', threads=%d, workers=2)",
+            "(compute='%s', threads=%d)",
             config.whisper_realtime,
             config.whisper_batch,
             config.compute_type,
@@ -111,14 +114,14 @@ class WhisperEngine:
     def _load_model(self, size: str) -> WhisperModel:
         """
         Instantiate a WhisperModel with offline-first loading.
-        num_workers=2: allows CTranslate2 to preprocess the next audio chunk
-        while the current one is being inferred — hides preprocessing latency.
+        num_workers=1: ZOLA never runs two transcriptions on one model at once,
+        and a second worker cost +164 MB RAM even on the 78 MB Swift model.
         """
         _common_kwargs = dict(
             device="cpu",
             compute_type=self._config.compute_type,
             cpu_threads=self._config.cpu_threads,
-            num_workers=2,   # Up from 1: preprocessing overlaps with inference
+            num_workers=1,
         )
 
         local_dir = MODELS_DIR / size
@@ -160,19 +163,23 @@ class WhisperEngine:
         other = "batch" if slot == "realtime" else "realtime"
 
         async with self._lock:
-            attr = f"_{slot}"
-            setattr(self, attr, None)
-            self._names[slot] = None
-            gc.collect()
+            self._models_ready.clear()
+            try:
+                attr = f"_{slot}"
+                setattr(self, attr, None)
+                self._names[slot] = None
+                gc.collect()
 
-            if not fresh and new_model_name == self._names[other]:
-                new_model = getattr(self, f"_{other}")
-            else:
-                new_model = await loop.run_in_executor(
-                    None, self._load_model, new_model_name
-                )
-            setattr(self, attr, new_model)
-            self._names[slot] = new_model_name
+                if not fresh and new_model_name == self._names[other]:
+                    new_model = getattr(self, f"_{other}")
+                else:
+                    new_model = await loop.run_in_executor(
+                        None, self._load_model, new_model_name
+                    )
+                setattr(self, attr, new_model)
+                self._names[slot] = new_model_name
+            finally:
+                self._models_ready.set()
 
             logger.info(
                 "WhisperEngine: slot='%s' swapped to '%s'", slot, new_model_name,
@@ -181,6 +188,15 @@ class WhisperEngine:
     # ----------------------------------------------------------------------- #
     # Internal helpers
     # ----------------------------------------------------------------------- #
+    def _model_for(self, slot: str) -> WhisperModel:
+        """The model in `slot`, waiting out a hot_reload() in progress."""
+        if not self._models_ready.wait(timeout=600):
+            raise RuntimeError(f"timed out waiting for the {slot} model to load")
+        model = getattr(self, f"_{slot}")
+        if model is None:
+            raise RuntimeError(f"no {slot} model loaded (the last model change failed)")
+        return model
+
     def _build_initial_prompt(self, prev_text: str = "", mode: str = "batch") -> str | None:
         """
         Build the initial_prompt string for a Whisper call.
@@ -262,32 +278,17 @@ class WhisperEngine:
     # ----------------------------------------------------------------------- #
     # Transcription (synchronous — run in ThreadPoolExecutor)
     # ----------------------------------------------------------------------- #
-    def transcribe_file(self, audio_path: Union[str, Path], mode: str = "batch") -> str:
+    def transcribe_audio(self, audio: np.ndarray, mode: str = "batch") -> str:
         """
-        Transcribe a WAV file using the batch or realtime model.
+        Transcribe a whole recording (16 kHz float32) with the batch or realtime model.
 
-        Thread safety: snapshots the model reference under the asyncio.Lock
-        before releasing it, so hot_reload() cannot delete the model mid-call.
+        Thread safety: holds its own reference to the model, so a later
+        hot_reload() cannot free it mid-call; waits if a reload is under way.
         """
-        # We are in a ThreadPoolExecutor — get model reference safely.
-        # Since asyncio.Lock is not thread-safe, we use the fact that
-        # Python attribute reads are atomic in CPython (GIL protected).
-        # The snapshot means we hold a reference even if hot_reload() runs.
-        model = self._realtime if mode == "realtime" else self._batch
-        model_name = (
-            self._config.whisper_realtime if mode == "realtime"
-            else self._config.whisper_batch
-        )
-
-        logger.debug(
-            "WhisperEngine.transcribe_file: model='%s', path=%s",
-            model_name, audio_path,
-        )
         t0 = time.monotonic()
 
         try:
-            sample_rate, data = wavfile.read(str(audio_path))
-            audio = data.astype(np.float32) / 32768.0
+            model = self._model_for("realtime" if mode == "realtime" else "batch")
 
             # One call for the whole recording: Whisper windows it internally,
             # so no word is split at an arbitrary chunk boundary.
@@ -306,11 +307,11 @@ class WhisperEngine:
             )
             transcript = _join_segments(segments)
             elapsed = time.monotonic() - t0
-            audio_duration = len(audio) / sample_rate
+            audio_duration = len(audio) / 16000
             rtf = elapsed / audio_duration if audio_duration > 0 else 0.0
 
             logger.info(
-                "WhisperEngine.transcribe_file: %.1fs audio → %.1fs inference "
+                "WhisperEngine.transcribe_audio: %.1fs audio → %.1fs inference "
                 "(RTF=%.2f), chars=%d",
                 audio_duration, elapsed, rtf, len(transcript),
             )
@@ -320,7 +321,7 @@ class WhisperEngine:
             return transcript
 
         except Exception as exc:
-            logger.exception("WhisperEngine.transcribe_file failed: %s", exc)
+            logger.exception("WhisperEngine.transcribe_audio failed: %s", exc)
             return ""
 
     def transcribe_chunk(
@@ -333,16 +334,15 @@ class WhisperEngine:
         Transcribe a live audio chunk (numpy float32 array) using the realtime model.
         Optimised for speed: beam_size=1, VAD enabled to skip silence frames.
 
-        Thread safety: same GIL-atomic attribute snapshot as transcribe_file.
+        Thread safety: same model handling as transcribe_audio.
         """
         if len(audio) < sample_rate * 0.2:
             return ""
 
-        # Atomic snapshot of realtime model reference (GIL-protected)
-        model = self._realtime
         initial_prompt = self._build_initial_prompt(prev_text, mode="realtime")
 
         try:
+            model = self._model_for("realtime")
             segments, info = model.transcribe(
                 audio,
                 language=self._resolve_language(model, audio, "realtime"),
@@ -372,7 +372,7 @@ class WhisperEngine:
             logger.exception("WhisperEngine.transcribe_chunk failed: %s", exc)
             return ""
 
-    def translate_file(self, audio_path: Union[str, Path]) -> str:
+    def translate_audio(self, audio: np.ndarray) -> str:
         """
         Translate non-English audio (e.g. Hindi) directly to English text
         using Whisper's built-in translation task (task="translate").
@@ -381,16 +381,12 @@ class WhisperEngine:
         No Ollama required — Whisper handles the translation natively.
         Uses the batch model for best accuracy.
 
-        Thread safety: GIL-atomic batch model snapshot.
+        Thread safety: same model handling as transcribe_audio.
         """
-        model = self._batch  # atomic snapshot
-        logger.debug("WhisperEngine.translate_file: path=%s", audio_path)
         t0 = time.monotonic()
 
         try:
-            sample_rate, data = wavfile.read(str(audio_path))
-            audio = data.astype(np.float32) / 32768.0
-
+            model = self._model_for("batch")
             segments, info = model.transcribe(
                 audio,
                 language=self._resolve_language(model, audio, "batch"),
@@ -405,10 +401,10 @@ class WhisperEngine:
             )
             transcript = _join_segments(segments)
             elapsed = time.monotonic() - t0
-            audio_duration = len(audio) / sample_rate
+            audio_duration = len(audio) / 16000
             detected_lang = info.language
             logger.info(
-                "WhisperEngine.translate_file: %.1fs audio → %.1fs inference, "
+                "WhisperEngine.translate_audio: %.1fs audio → %.1fs inference, "
                 "chars=%d (source lang detected: %s)",
                 audio_duration, elapsed, len(transcript),
                 detected_lang,
@@ -416,7 +412,7 @@ class WhisperEngine:
             return transcript
 
         except Exception as exc:
-            logger.exception("WhisperEngine.translate_file failed: %s", exc)
+            logger.exception("WhisperEngine.translate_audio failed: %s", exc)
             return ""
 
 
@@ -465,10 +461,7 @@ class _SherpaTransducer:
             num_threads=threads,
         )
 
-    def transcribe(self, audio, language: str | None = None, **_whisper_options):
-        if not isinstance(audio, np.ndarray):
-            _, data = wavfile.read(str(audio))
-            audio = data.astype(np.float32) / 32768.0
+    def transcribe(self, audio: np.ndarray, language: str | None = None, **_whisper_options):
         stream = self._recognizer.create_stream()
         stream.set_option("language", language or "auto")
         stream.accept_waveform(16000, audio)

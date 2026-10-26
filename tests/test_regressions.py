@@ -102,7 +102,7 @@ class _Recorder:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
 
-    def start(self, audio_path, device=None) -> None:
+    def start(self, device=None) -> None:
         if self.fail:
             raise RuntimeError("no mic")
 
@@ -110,7 +110,7 @@ class _Recorder:
         pass
 
     def stop(self):
-        return Path("/nonexistent"), 0.0
+        return np.zeros(0, dtype=np.float32), 0.0
 
     async def monitor_until_silence(self, **kwargs) -> None:
         await asyncio.sleep(3600)
@@ -132,8 +132,10 @@ class ApiTests(_TempConfig):
         zapp.app.state.stt = object()   # "models loaded"; only touched when a model setting changes
         zapp.app.state.injector = None  # only touched once a transcript exists
         zapp._last_trigger_time = 0.0
+        zapp._API_TOKEN = "test-token"
         # No context manager: the lifespan (models, uinput) is not run.
-        self.client = TestClient(zapp.app, base_url="http://127.0.0.1:5001")
+        self.client = TestClient(zapp.app, base_url="http://127.0.0.1:5001",
+                                 headers={"Authorization": "Bearer test-token"})
 
     def test_trigger_dispatches_to_active_mode(self) -> None:
         r = self.client.post("/trigger")
@@ -185,6 +187,41 @@ class ApiTests(_TempConfig):
         r = self.client.post("/settings", json={"whisper_batch": "base"})
         self.assertEqual(r.status_code, 409)
         self.assertEqual(self.client.post("/settings", json={"paste_method": "shift_insert"}).status_code, 200)
+
+    def test_api_requires_the_token(self) -> None:
+        anon = TestClient(zapp.app, base_url="http://127.0.0.1:5001")
+        for method, path in (("post", "/trigger"), ("get", "/history"), ("get", "/events"),
+                             ("get", "/settings"), ("post", "/cancel")):
+            self.assertEqual(getattr(anon, method)(path).status_code, 401, path)
+        wrong = {"Authorization": "Bearer nope"}
+        self.assertEqual(anon.get("/history", headers=wrong).status_code, 401)
+        self.assertEqual(anon.get("/events?token=nope").status_code, 401)
+        self.assertFalse(zapp.app.state.app_state.is_recording)
+        # CORS preflight carries no credentials and must still succeed
+        pre = anon.options("/settings", headers={
+            "Origin": "tauri://localhost", "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type"})
+        self.assertEqual(pre.status_code, 200)
+        self.assertEqual(self.client.get("/history").status_code, 200)
+
+    def test_stop_right_after_start_is_not_rate_limited(self) -> None:
+        async def scenario():
+            class _Req:
+                app = zapp.app
+            started = await zapp._toggle_recording(_Req(), zapp.RecordingMode.BATCH)
+            stopping = await zapp._toggle_recording(_Req(), zapp.RecordingMode.BATCH)
+            await zapp.app.state.app_state.cancel_realtime_task()
+            return started.body, stopping.body
+        started, stopping = asyncio.run(scenario())
+        self.assertIn(b'"started"', started)
+        self.assertIn(b'"stopping"', stopping)
+
+    def test_losing_a_start_race_returns_409(self) -> None:
+        class _RacedState(zapp.AppState):
+            async def start_recording(self, mode):  # another trigger got there first
+                raise RuntimeError("Already recording in mode 'batch'.")
+        zapp.app.state.app_state = _RacedState()
+        self.assertEqual(self.client.post("/trigger/batch").status_code, 409)
 
     def test_cancel_discards_recording(self) -> None:
         self.assertEqual(self.client.post("/cancel").json(), {"status": "idle"})
@@ -256,6 +293,69 @@ class TextAndHistoryTests(unittest.TestCase):
         hinglish = "main English aur hindi donon mein baar baar switch karta raha hoon yah dekhane ke lie"
         self.assertFalse(_plausible_edit(hinglish, "Main Hindi aur English, agar phirka aapki saaree kya ho jaata hai.", "preserve"))
         self.assertTrue(_plausible_edit(hinglish, "Main English aur Hindi donon mein baar-baar switch karta raha hoon, yah dekhane ke lie.", "preserve"))
+
+    def test_turning_history_off_deletes_the_file(self) -> None:
+        from state import AppState, RecordingMode
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.json"
+            st = AppState(history_max=5, history_path=path)
+            asyncio.run(st.add_history(RecordingMode.BATCH, "private words", 1.0))
+            self.assertTrue(path.exists())
+            st.set_history_path(None)
+            self.assertFalse(path.exists())
+
+    def test_token_file_is_private_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = config.CONFIG_DIR
+            config.CONFIG_DIR = Path(tmp)
+            try:
+                token = config.load_or_create_token()
+                self.assertGreaterEqual(len(token), 32)
+                self.assertEqual((Path(tmp) / "token").stat().st_mode & 0o777, 0o600)
+                self.assertEqual(config.load_or_create_token(), token)
+            finally:
+                config.CONFIG_DIR = saved
+
+    def test_transcription_waits_for_a_model_swap(self) -> None:
+        import threading
+        from types import SimpleNamespace
+        import core_stt
+
+        class _Model:
+            def transcribe(self, audio, **kwargs):
+                return [SimpleNamespace(text="kal meeting hai")], SimpleNamespace(language="en")
+
+        engine = core_stt.WhisperEngine.__new__(core_stt.WhisperEngine)
+        engine._config = config.Config(**{**config._DEFAULTS, "spoken_language": "en"})
+        engine._names = {"realtime": None, "batch": None}
+        engine._realtime = engine._batch = None
+        engine._models_ready = threading.Event()  # a hot_reload() is in progress
+
+        def finish_reload():
+            time.sleep(0.3)
+            engine._realtime = _Model()
+            engine._names["realtime"] = "base"
+            engine._models_ready.set()
+        threading.Thread(target=finish_reload).start()
+        audio = np.zeros(16000, dtype=np.float32)
+        self.assertEqual(engine.transcribe_chunk(audio, 16000), "kal meeting hai")
+
+    def test_wl_copy_gets_text_on_stdin_and_does_not_hang(self) -> None:
+        import stat
+        from injector import KeystrokeInjector
+        with tempfile.TemporaryDirectory() as tmp:
+            # Fake wl-copy: records argv and stdin, then leaves a child holding
+            # stderr open, as the real one does while it serves the clipboard
+            fake = Path(tmp) / "wl-copy"
+            fake.write_text('#!/bin/sh\necho "$@" > "$0.args"\ncat > "$0.stdin"\n(sleep 5) &\n')
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            inj = KeystrokeInjector.__new__(KeystrokeInjector)
+            inj._wayland_env = {"PATH": f"{tmp}:{os.environ['PATH']}"}
+            t0 = time.monotonic()
+            self.assertTrue(asyncio.run(inj._wl_copy("मेरा secret text")))
+            self.assertLess(time.monotonic() - t0, 2.0)
+            self.assertEqual(Path(f"{fake}.stdin").read_text(), "मेरा secret text")
+            self.assertNotIn("secret", Path(f"{fake}.args").read_text())
 
     def test_history_survives_restart_and_clears(self) -> None:
         from state import AppState, RecordingMode
@@ -339,7 +439,9 @@ class ModelStoreTests(unittest.TestCase):
     def test_endpoints_validate_names_and_usage(self) -> None:
         zapp.app.state.config = config.Config(**config._DEFAULTS)
         zapp.app.state.downloads = {}
-        client = TestClient(zapp.app, base_url="http://127.0.0.1:5001")
+        zapp._API_TOKEN = "test-token"
+        client = TestClient(zapp.app, base_url="http://127.0.0.1:5001",
+                            headers={"Authorization": "Bearer test-token"})
         names = [m["name"] for m in client.get("/models/catalog").json()["models"]]
         self.assertIn("hinglish-swift", names)
         self.assertEqual(client.post("/models/download", json={"name": "evil"}).status_code, 404)

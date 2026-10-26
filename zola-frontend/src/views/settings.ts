@@ -351,8 +351,7 @@ const view: ViewModule = {
             <div class="settings-section-title">SYSTEM_REGISTRY // GLOBAL_TRIGGER_CONFIGURATION</div>
             <p style="font-size:11px; color: var(--subtle-green); margin: 0 0 16px; opacity: 0.8;">
               Choose what the hotkey does. Zola does not register the hotkey itself: add it in your desktop's
-              shortcut settings (niri: <code>config.kdl</code> binds) to run
-              <code>curl -s -X POST http://127.0.0.1:5001/trigger</code>.
+              shortcut settings (niri: <code>config.kdl</code> binds) to run <code>zola-trigger</code>.
             </p>
             <div class="matrix-grid" style="margin-bottom: 28px;">
               <div class="select-container" style="border: 1px solid var(--forest-green); padding: 14px; background: rgba(0,0,0,0.3);">

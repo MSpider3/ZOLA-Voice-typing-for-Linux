@@ -18,6 +18,7 @@ import ipaddress
 import json
 import logging
 import os
+import secrets
 import shutil
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -342,6 +343,25 @@ class Config:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+def load_or_create_token() -> str:
+    """
+    The local API token, created on first start in CONFIG_DIR/token (mode 0600).
+    It keeps other users and network-sandboxed apps from using the API;
+    programs running as the same user can read it, as with any local secret.
+    """
+    path = CONFIG_DIR / "token"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return path.read_text(encoding="utf-8").strip()
+    token = secrets.token_urlsafe(32)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(token + "\n")
+    logger.info("Created API token at %s", path)
+    return token
+
+
 def installed_models() -> list[str]:
     """Names of the model folders found in MODELS_DIR."""
     if not MODELS_DIR.is_dir():

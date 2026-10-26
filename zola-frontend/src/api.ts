@@ -1,9 +1,10 @@
+import { invoke } from '@tauri-apps/api/core';
+
 const API_BASE = 'http://127.0.0.1:5001';
 
 export interface StatusData {
   is_recording: boolean;
   active_mode: string | null;
-  current_audio_path: string;
   uptime_s: number;
   ollama_model: string;
   whisper_realtime: string;
@@ -42,19 +43,34 @@ export class ZolaAPI {
   private reconnectTimeout: number | null = null;
   private reconnectAttempt = 0;
   private static readonly MAX_BACKOFF_MS = 15000;
+  // The daemon's API token, read from ~/.config/zola/token by the Tauri side.
+  // The daemon creates it on first start, possibly after the app opened, so a
+  // missing or rejected token is simply re-read on the next request.
+  private token: string | null = null;
 
   constructor() {}
 
-  /** Helper to perform a fetch with a timeout */
+  private async getToken(): Promise<string> {
+    if (!this.token) {
+      this.token = await invoke<string>('api_token').catch(() => null);
+    }
+    return this.token ?? '';
+  }
+
+  /** Helper to perform a fetch with a timeout and the API token */
   private async fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 5000): Promise<Response> {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      const headers = new Headers(options.headers);
+      headers.set('Authorization', `Bearer ${await this.getToken()}`);
       const response = await fetch(url, {
         ...options,
+        headers,
         signal: controller.signal
       });
       clearTimeout(id);
+      if (response.status === 401) this.token = null;
       return response;
     } catch (err) {
       clearTimeout(id);
@@ -193,7 +209,7 @@ export class ZolaAPI {
   }
 
   /** Internal SSE connection logic with exponential backoff + jitter reconnection */
-  private connectSSE(): void {
+  private async connectSSE(): Promise<void> {
     if (this.eventSource) {
       this.eventSource.close();
     }
@@ -203,7 +219,9 @@ export class ZolaAPI {
       this.reconnectTimeout = null;
     }
 
-    this.eventSource = new EventSource(`${API_BASE}/events`);
+    // EventSource cannot send headers, so the token goes in the query string
+    const token = await this.getToken();
+    this.eventSource = new EventSource(`${API_BASE}/events?token=${encodeURIComponent(token)}`);
 
     this.eventSource.onopen = () => {
       this.reconnectAttempt = 0; // Reset counter on successful connection
@@ -255,6 +273,7 @@ export class ZolaAPI {
     });
 
     this.eventSource.onerror = (_e) => {
+      this.token = null; // re-read it on reconnect (EventSource hides a 401)
       // Signal OFFLINE immediately so UI updates without delay
       if (this.connectionCallback) {
         this.connectionCallback('OFFLINE');

@@ -254,17 +254,22 @@ class KeystrokeInjector:
 
     async def _wl_copy(self, text: str, primary: bool = False) -> bool:
         """Put text into the clipboard (or the primary selection). True on success."""
-        args = ["wl-copy"] + (["--primary"] if primary else []) + ["--", text]
+        # Text goes on stdin: a command-line argument would be visible to every
+        # local process (ps, /proc/<pid>/cmdline) for as long as wl-copy serves it.
+        # stderr must not be a pipe: wl-copy forks a server that keeps it open, so
+        # waiting for it hung every paste for the full timeout (then fell back to
+        # ASCII-only typing).
+        args = ["wl-copy"] + (["--primary"] if primary else [])
         proc = await asyncio.create_subprocess_exec(
             *args,
             env=self._wayland_env,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        await asyncio.wait_for(proc.communicate(text.encode("utf-8")), timeout=5.0)
         if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
-            logger.error("KeystrokeInjector: wl-copy exited %d: %s", proc.returncode, err)
+            logger.error("KeystrokeInjector: wl-copy exited %d", proc.returncode)
             return False
         return True
 
@@ -398,20 +403,7 @@ class KeystrokeInjector:
             )
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "wl-copy", "--", text,
-                env=self._wayland_env,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-            if proc.returncode != 0:
-                err = stderr.decode(errors="replace").strip() if stderr else "(no stderr)"
-                logger.error(
-                    "KeystrokeInjector.copy_to_clipboard: wl-copy exited %d: %s",
-                    proc.returncode, err,
-                )
-            else:
+            if await self._wl_copy(text):
                 logger.debug(
                     "KeystrokeInjector.copy_to_clipboard: %d chars in clipboard", len(text)
                 )

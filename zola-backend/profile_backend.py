@@ -47,8 +47,11 @@ import sys
 import time
 
 import httpx
+from pathlib import Path
 
 BASE_URL = "http://127.0.0.1:5001"
+# The daemon requires its API token (created on first start)
+AUTH = {"Authorization": "Bearer " + (Path.home() / ".config" / "zola" / "token").read_text().strip()}
 PROFILE_OUTPUT = "/tmp/zola_profile.prof"  # nosec B108
 PROFILER_MODE = os.environ.get("PROFILER", "cprofile").lower()
 
@@ -77,7 +80,7 @@ async def run_workload():
     timeout = httpx.Timeout(30.0, connect=5.0)
     print(f"\n  {CYAN}Running synthetic workload against {BASE_URL}...{RESET}")
 
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=timeout) as client:
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=timeout, headers=AUTH) as client:
         steps = [
             ("GET", "/status", None),
             ("GET", "/history?limit=50", None),

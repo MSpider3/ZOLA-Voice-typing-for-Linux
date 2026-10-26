@@ -1,0 +1,7 @@
+#!/bin/sh
+# zola-trigger — start/stop ZOLA dictation. Bind it to a key in your desktop's
+# shortcut settings (niri: Mod+H { spawn "zola-trigger"; }).
+# The API token goes to curl on stdin, so it never shows in the process list.
+token_file="${XDG_CONFIG_HOME:-$HOME/.config}/zola/token"
+printf 'Authorization: Bearer %s\n' "$(cat "$token_file")" |
+    exec curl -s -X POST -H @- http://127.0.0.1:5001/trigger

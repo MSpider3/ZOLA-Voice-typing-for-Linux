@@ -42,13 +42,15 @@
       "deb": {
         "depends": ["libportaudio2"],
         "files": {
-          "/usr/lib/udev/rules.d/70-zola-uinput.rules": "resources/70-zola-uinput.rules"
+          "/usr/lib/udev/rules.d/70-zola-uinput.rules": "resources/70-zola-uinput.rules",
+          "/usr/bin/zola-trigger": "resources/zola-trigger"
         }
       },
       "rpm": {
         "depends": ["portaudio"],
         "files": {
-          "/usr/lib/udev/rules.d/70-zola-uinput.rules": "resources/70-zola-uinput.rules"
+          "/usr/lib/udev/rules.d/70-zola-uinput.rules": "resources/70-zola-uinput.rules",
+          "/usr/bin/zola-trigger": "resources/zola-trigger"
         }
       }
     }

@@ -223,7 +223,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Zola Backend",
     description="Linux-native Speech-to-Text daemon for Fedora/Niri Wayland",
-    version="1.3.0",
+    version="1.3.1",
     lifespan=lifespan,
 )
 
